@@ -1,0 +1,57 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg
+
+# Node / pnpm
+node_modules/
+pnpm-lock.yaml
+.pnpm-store/
+*.tsbuildinfo
+
+# Rust
+target/
+Cargo.lock
+
+# Go
+/bin/
+*.test
+*.out
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Claude Code dev memory (local, not shared)
+.claude/memory/
+.claude/audit_logs/
+.claude/state/
+
+# Build artifacts
+*.log
+coverage/
+.coverage
+htmlcov/
