@@ -120,45 +120,89 @@ tool_json="$(printf '%s' "$raw_input" | jq -c '
 ' 2>/dev/null || echo "null")"
 [ -z "$tool_json" ] && tool_json="null"
 
-# Phase 0: Only UserPromptSubmit routes to VGE for detection.
-# Audit-only events (tool calls, session lifecycle) are deferred to Phase 1
-# pending VGE pipeline refinement to avoid false BLOCK decisions on benign audit events.
-if [ "$hook_event" != "UserPromptSubmit" ]; then
-  log "INFO skipped event=$hook_event (audit-only, phase 1 deferred)"
-  exit 0
-fi
+# Extract last user message from conversation for original_prompt context.
+extract_last_user_message() {
+  printf '%s' "$conversation_json" | jq -r '
+    map(select(.role == "user"))
+    | last
+    | .content // ""
+  ' 2>/dev/null || echo ""
+}
 
-endpoint="/v1/guard/input"
-source_field='"user_input"'
-analyze=false
+# Route per hook event.
+# Phase 0+: UserPromptSubmit (detection) + PostToolUse (output analysis).
+# Deferred: PreToolUse, Stop, SessionStart/End, etc. (pending audit pipeline redesign).
+case "$hook_event" in
+  UserPromptSubmit)
+    endpoint="/v1/guard/input"
+    source_field='"user_input"'
+    analyze=false
+    ;;
+  PostToolUse)
+    # Tool response analysis: send output to /v1/guard/output with original prompt context.
+    endpoint="/v1/guard/output"
+    source_field='"tool_output"'
+    analyze=false
+    original_prompt="$(extract_last_user_message)"
+    ;;
+  *)
+    log "INFO skipped event=$hook_event (deferred to phase 1)"
+    exit 0
+    ;;
+esac
 
 build_payload() {
   local mode="$1"
-  jq -n \
-    --arg prompt "$prompt_text" \
-    --arg sid "$session_id" \
-    --arg pid "$prompt_id" \
-    --arg ev "$hook_event" \
-    --argjson trunc "$truncated" \
-    --argjson conv "$conversation_json" \
-    --argjson tool "$tool_json" \
-    --argjson analyze "$analyze" \
-    --arg src_raw "$source_field" \
-    --arg mode "$mode" '
-    (if $analyze
-       then {text: (if ($prompt | length) > 0 then $prompt else "[claude-code audit] event=\($ev) tool=\($tool.name // "none")" end),
-             source: ($src_raw | fromjson)}
-       else {prompt: $prompt} end)
-    + (if $mode == "typed" or $mode == "auto"
-       then {agent: {framework: "claude-code", sessionId: $sid, promptId: $pid, hookEvent: $ev}}
-       else {} end)
-    + (if $tool != null then {tool: $tool} else {} end)
-    + (if ($conv | length) > 0 then {conversation: $conv} else {} end)
-    + (if $mode == "legacy" or $mode == "auto"
-       then {metadata: ({platform: "claude-code", session_id: $sid, prompt_id: $pid, hookEvent: $ev}
-              + (if $trunc then {vge_prompt_truncated: true} else {} end))}
-       else (if $trunc then {metadata: {vge_prompt_truncated: true}} else {} end) end)
-  '
+  local endpoint="$2"
+  local original_prompt="$3"
+
+  if [ "$endpoint" = "/v1/guard/output" ]; then
+    # /v1/guard/output format: output (tool response) + original_prompt (context)
+    jq -n \
+      --arg output "$prompt_text" \
+      --arg orig_prompt "$original_prompt" \
+      --arg sid "$session_id" \
+      --arg pid "$prompt_id" \
+      --arg ev "$hook_event" \
+      --argjson tool "$tool_json" \
+      --arg mode "$mode" '
+      {output: $output}
+      + (if ($orig_prompt | length) > 0 then {original_prompt: $orig_prompt} else {} end)
+      + (if $mode == "typed" or $mode == "auto"
+         then {agent: {framework: "claude-code", sessionId: $sid, promptId: $pid, hookEvent: $ev}}
+         else {} end)
+      + (if $tool != null then {tool: $tool} else {} end)
+      + {metadata: {platform: "claude-code", session_id: $sid, prompt_id: $pid, hookEvent: $ev}
+                   + (if $tool != null and $tool.name != null then {tool_name: $tool.name} else {} end)}
+    '
+  else
+    # /v1/guard/input format: prompt + agent/tool/conversation context
+    jq -n \
+      --arg prompt "$prompt_text" \
+      --arg sid "$session_id" \
+      --arg pid "$prompt_id" \
+      --arg ev "$hook_event" \
+      --argjson trunc "$truncated" \
+      --argjson conv "$conversation_json" \
+      --argjson tool "$tool_json" \
+      --argjson analyze "$analyze" \
+      --arg src_raw "$source_field" \
+      --arg mode "$mode" '
+      (if $analyze
+         then {text: (if ($prompt | length) > 0 then $prompt else "[claude-code audit] event=\($ev) tool=\($tool.name // "none")" end),
+               source: ($src_raw | fromjson)}
+         else {prompt: $prompt} end)
+      + (if $mode == "typed" or $mode == "auto"
+         then {agent: {framework: "claude-code", sessionId: $sid, promptId: $pid, hookEvent: $ev}}
+         else {} end)
+      + (if $tool != null then {tool: $tool} else {} end)
+      + (if ($conv | length) > 0 then {conversation: $conv} else {} end)
+      + (if $mode == "legacy" or $mode == "auto"
+         then {metadata: ({platform: "claude-code", session_id: $sid, prompt_id: $pid, hookEvent: $ev}
+                + (if $trunc then {vge_prompt_truncated: true} else {} end))}
+         else (if $trunc then {metadata: {vge_prompt_truncated: true}} else {} end) end)
+    '
+  fi
 }
 
 post() {
@@ -172,11 +216,11 @@ post() {
     --data-binary "$body" 2>/dev/null || echo "000"
 }
 
-payload="$(build_payload "$wire")"
+payload="$(build_payload "$wire" "$endpoint" "${original_prompt:-}")"
 
 if [ "$dry" = "1" ]; then
   redacted="$(printf '%s' "$payload" | jq -c '.')"
-  log "DRY_RUN url=$api_url key=vg_*** event=$hook_event session=$session_id truncated=$truncated bytes=$(printf '%s' "$payload" | wc -c | tr -d ' ')"
+  log "DRY_RUN url=$api_url key=vg_*** event=$hook_event session=$session_id bytes=$(printf '%s' "$payload" | wc -c | tr -d ' ')"
   log "DRY_RUN payload=$redacted"
   exit 0
 fi
@@ -184,11 +228,11 @@ fi
 status="$(post "$payload")"
 
 if [ "$status" = "400" ] && [ "$wire" = "auto" ]; then
-  payload="$(build_payload "legacy")"
+  payload="$(build_payload "legacy" "$endpoint" "${original_prompt:-}")"
   status="$(post "$payload")"
   log "INFO retry_legacy status=$status event=$hook_event session=$session_id"
 else
-  log "INFO status=$status event=$hook_event session=$session_id truncated=$truncated"
+  log "INFO status=$status event=$hook_event session=$session_id"
 fi
 
 exit 0
