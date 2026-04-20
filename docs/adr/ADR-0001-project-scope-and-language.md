@@ -16,7 +16,7 @@ The vge-agent-guard product is specified in [docs/architecture/claude-code-agent
 **Deferred.** This ADR is a placeholder; the decision will be made after a short spike (est. 1 day per candidate language) that covers:
 
 - Hook HTTP / stdin-JSON handshake responsiveness.
-- TUI library ergonomics (for the split-pane `vge-guard` dashboard).
+- TUI library ergonomics (for the split-pane `vge-cc-guard` dashboard).
 - Single-binary distribution story (developers will install, not run `pnpm dev`).
 - Cross-platform support (macOS + Linux at minimum).
 

@@ -1,8 +1,8 @@
-# vge-guard Configurator Design
+# vge-cc-guard Configurator Design
 
 **TUI-based configuration for Phase 1 sidecar.**
 
-Command: `vge-guard config` — interactive terminal UI for API keys and policies.
+Command: `vge-cc-guard config` — interactive terminal UI for API keys and policies.
 
 ---
 
@@ -54,10 +54,10 @@ Command: `vge-guard config` — interactive terminal UI for API keys and policie
 │      ✓ CONFIGURATION SAVED              │
 │                                         │
 │  Settings saved to:                     │
-│  ~/.vge-guard/config.json               │
+│  ~/.vge-cc-guard/config.json               │
 │                                         │
 │  Next steps:                            │
-│  • Run: vge-guard daemon                │
+│  • Run: vge-cc-guard daemon                │
 │  • Check logs: tail -f /tmp/vge-*.log   │
 │                                         │
 │              [OK - Return to Menu]      │
@@ -83,7 +83,7 @@ Command: `vge-guard config` — interactive terminal UI for API keys and policie
 │    View Current Config                │
 │    Exit                               │
 │                                      │
-│  Current config: ~/.vge-guard/        │
+│  Current config: ~/.vge-cc-guard/        │
 │  Status: ✓ configured                 │
 └──────────────────────────────────────┘
 ```
@@ -192,7 +192,7 @@ Or error:
 
 ### 2.4 View Current Config
 
-Read-only view of `~/.vge-guard/config.json`:
+Read-only view of `~/.vge-cc-guard/config.json`:
 
 ```
 ┌──────────────────────────────────────────────┐
@@ -214,7 +214,7 @@ Read-only view of `~/.vge-guard/config.json`:
 │    N/A (auto-block enabled)                  │
 │                                              │
 │  Config file:                                │
-│    ~/.vge-guard/config.json                  │
+│    ~/.vge-cc-guard/config.json                  │
 │                                              │
 │  Last modified:                              │
 │    2026-04-20 20:15:33                       │
@@ -229,7 +229,7 @@ Read-only view of `~/.vge-guard/config.json`:
 
 ### 3.1 config.json
 
-Stored in `~/.vge-guard/config.json` (readable by vge-guard daemon):
+Stored in `~/.vge-cc-guard/config.json` (readable by vge-cc-guard daemon):
 
 ```json
 {
@@ -246,7 +246,7 @@ Stored in `~/.vge-guard/config.json` (readable by vge-guard daemon):
   },
   "advanced": {
     "log_level": "info",
-    "log_file": "/tmp/vge-guard.log"
+    "log_file": "/tmp/vge-cc-guard.log"
   }
 }
 ```
@@ -260,7 +260,7 @@ Stored in `~/.vge-guard/config.json` (readable by vge-guard daemon):
 
 ```
 Priority (highest first):
-1. ~/.vge-guard/config.json (user persisted config)
+1. ~/.vge-cc-guard/config.json (user persisted config)
 2. Environment variables (VGE_API_KEY, VGE_API_URL)
 3. Hardcoded defaults (URL only)
 
@@ -276,7 +276,7 @@ Example:
 ### Flow 1: First-time setup
 
 ```
-User runs: vge-guard config
+User runs: vge-cc-guard config
 
 1. Main Menu appears
 2. Select "API Keys Configuration"
@@ -290,14 +290,14 @@ User runs: vge-guard config
 9. Choose "Auto-block" (recommended)
 10. Click [Save]
 11. ✓ Configuration Saved screen appears
-12. User runs: vge-guard daemon
+12. User runs: vge-cc-guard daemon
     → Sidecar starts, ready for Claude Code
 ```
 
 ### Flow 2: Separate input/output keys (production)
 
 ```
-User runs: vge-guard config
+User runs: vge-cc-guard config
 
 1. Main Menu
 2. API Keys Configuration
@@ -387,7 +387,7 @@ export function ConfigMenu() {
 ```typescript
 import blessed from 'blessed';
 
-const screen = blessed.screen({ mouse: true, title: 'vge-guard config' });
+const screen = blessed.screen({ mouse: true, title: 'vge-cc-guard config' });
 const form = blessed.form({ parent: screen, /* ... */ });
 form.addButton({ text: 'Save', ... });
 ```
@@ -396,10 +396,10 @@ form.addButton({ text: 'Save', ... });
 
 ### 5.2 File Storage
 
-- **Location:** `~/.vge-guard/config.json`
+- **Location:** `~/.vge-cc-guard/config.json`
 - **Permissions:** `0600` (readable/writable by user only)
 - **Format:** JSON (human-readable, portable)
-- **Backup:** Auto-backup to `~/.vge-guard/config.json.bak` on save
+- **Backup:** Auto-backup to `~/.vge-cc-guard/config.json.bak` on save
 
 ### 5.3 Validation Rules
 
@@ -426,7 +426,7 @@ If connection fails:
   
 If config file corrupted:
   "❌ Config file corrupted"
-  "Path: ~/.vge-guard/config.json"
+  "Path: ~/.vge-cc-guard/config.json"
   "Restore backup? [Yes/No]"
 ```
 

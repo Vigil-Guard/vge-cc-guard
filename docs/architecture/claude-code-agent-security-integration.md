@@ -145,7 +145,7 @@ Verified against `https://code.claude.com/docs/en/`:
   │     caution / tainted          │
   │                                │
   │   TUI for configuration        │
-  │   (vge-guard command)          │
+  │   (vge-cc-guard command)          │
   └────────────────────────────────┘
       │
       │  REST + NATS
@@ -259,7 +259,7 @@ The sidecar is configured through a local TUI — a live terminal dashboard,
 not a web console. Philosophy: feel like `k9s`, `lazygit`, `htop` — one
 command, split-pane, keyboard-driven, live-updating.
 
-Command: `vge-guard`
+Command: `vge-cc-guard`
 
 ```
 ┌─ vge-agent-guard ── session: local ── status: clean ─────────────────┐
@@ -297,7 +297,7 @@ Views:
 - **Stats** — decision distribution, L1/L2 split, p50/p99 latency, cache
   hit rate, VGE availability.
 
-Configuration file: `~/.config/vge-guard/config.toml`. Simple, commentable,
+Configuration file: `~/.config/vge-cc-guard/config.toml`. Simple, commentable,
 and text-editor-friendly. The TUI is a live face onto the same file — edits
 made in either place are reflected live in the other.
 
@@ -316,21 +316,21 @@ Two supported paths.
 
 ```
 $ brew install vge-agent-guard          # or: pnpm dlx @vigilguard/agent-guard init
-$ vge-guard init                        # writes managed settings + hook config
-$ vge-guard                             # open TUI
+$ vge-cc-guard init                        # writes managed settings + hook config
+$ vge-cc-guard                             # open TUI
 ```
 
-`vge-guard init` writes:
+`vge-cc-guard init` writes:
 
 - `~/.claude/settings.json` — hooks registered, permission rules set,
   `allowManagedHooksOnly = true`.
-- `~/.config/vge-guard/config.toml` — sidecar config.
+- `~/.config/vge-cc-guard/config.toml` — sidecar config.
 - Starts the sidecar as a background service (launchd / systemd).
 
 **Organization rollout**
 
 Managed settings distributed by the organization override local settings.
-`vge-guard` runs in read-only TUI mode, users cannot weaken policy.
+`vge-cc-guard` runs in read-only TUI mode, users cannot weaken policy.
 ConfigChange hook blocks local attempts to override.
 
 ## Competitive Positioning
@@ -371,13 +371,13 @@ No Claude Code code is touched in this phase.
 ### Phase 1 — sidecar MVP (weeks 3–6)
 
 1. `vge-agent-guard` local daemon with L1/L2 decision path.
-2. `vge-guard` TUI: Rules, Events, Approvals, Audit, Policy, Session, Stats.
+2. `vge-cc-guard` TUI: Rules, Events, Approvals, Audit, Policy, Session, Stats.
 3. Managed-settings template that locks hooks, permissions, and
    `disableBypassPermissionsMode`.
 4. `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PermissionDenied`,
    `ConfigChange`, `SessionEnd` wired to the sidecar.
 5. Approval-fatigue mitigations enabled by default.
-6. Installer (`vge-guard init`) for macOS and Linux.
+6. Installer (`vge-cc-guard init`) for macOS and Linux.
 
 ### Phase 2 — production polish (weeks 7–10)
 
@@ -441,7 +441,7 @@ plane that survives the session.
 - Added L1/L2 latency budget.
 - Added fail-mode matrix.
 - Added approval-fatigue section.
-- Replaced HTTP admin surface with TUI (`vge-guard`).
+- Replaced HTTP admin surface with TUI (`vge-cc-guard`).
 - Consolidated rollout into Phase 0 (VGE wire-up) + Phase 1 (sidecar MVP) + Phase 2 (polish).
 - Corrected: `logDetectionRequest` status (ready, not wired), scopeDrift action domain (binary today), PostToolUse non-MCP limits, platform-rules irrelevance.
 - Confirmed competitive landscape: Lasso is the only direct shape competitor.
