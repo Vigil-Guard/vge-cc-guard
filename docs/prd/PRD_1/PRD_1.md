@@ -14,17 +14,17 @@
 
 ## 1. Executive Summary
 
-**Phase 0** (PRD_0, now complete) delivers a lightweight bash hook that captures user prompts and forwards them to VGE for detection. It's universal (install once, works everywhere), requires no per-project setup, and stays out of the way of Claude Code.
+**Phase 0 (now part of Phase 1 sidecar)** delivers prompt/output logging via Claude Code hooks. Captures user prompts and tool responses, forwards them to VGE for detection. Now implemented in TypeScript sidecar instead of separate bash hook.
 
-**Phase 1** (this document) builds on Phase 0 to add a **full native sidecar** written in TypeScript/Rust. The sidecar adds:
-- **Tool gating** — `PreToolUse` hook allows/blocks tool execution based on VGE decisions
-- **Audit enforcement** — `PostToolUse` for tool-output analysis
-- **Session state tracking** — detect prompt injections that evolve across multiple turns
-- **L1/L2 heuristics locally** — fast pattern matching without network roundtrip
-- **Configuration UI** — `vge-cc-guard config` TUI for easy setup and management
-- **Server-managed policies** — operators push rules without redeploying sidecars
+**Phase 1** (this document) delivers a **full native sidecar** written in TypeScript/Node.js. The sidecar:
+- **Replaces Phase 0 bash hook** — handles `UserPromptSubmit` and `PostToolUse` hooks, logs to VGE
+- **Tool gating** — intercepts `PreToolUse` hook, allows/blocks tool execution based on L1 + session state
+- **Session state tracking** — detects prompt injections evolving across multiple turns (clean → caution → tainted)
+- **L1 heuristics locally** — fast pattern matching (<50ms) without waiting for VGE
+- **Configuration UI** — `vge-cc-guard config` TUI for easy setup
+- **Graceful VGE failover** — falls back to L1-only decisions if VGE unreachable
 
-Phase 1 is significantly more complex than Phase 0 but solves real gaps: tool gating, session risk scoring, and operator control.
+Phase 1 consolidates Phase 0 and adds tool gating + session awareness.
 
 ---
 
@@ -81,14 +81,13 @@ VGE receives both events
 
 Phase 1 must:
 
-1. **Tool gating via PreToolUse:** Intercept tool execution, query VGE/L1 for decision (ALLOW/BLOCK), gate tool based on risk.
-2. **Session state machine:** Track conversation state (clean → caution → tainted) based on detection signals. Boost risk scoring for risky prompts in tainted sessions.
-3. **Local L1 heuristics:** Run pattern matching locally before querying VGE. Fast path: reject obvious attacks in <10ms without network.
-4. **L2 dispatch:** For borderline cases, async POST to VGE for semantic/llm-guard analysis. Non-blocking.
-5. **Configuration UI:** `vge-cc-guard config` TUI lets users enable/disable features, set thresholds, choose which tools are gatable.
-6. **Server-managed policies:** Sidecar polls `/v1/policies` endpoint for rule updates. Operators can push rules without redeploying.
-7. **Session lifecycle:** Hooks for SessionStart, SessionEnd to initialize/cleanup state.
-8. **Audit trail:** Log all decisions (ALLOW/BLOCK/QUARANTINE) locally + to VGE for compliance.
+1. **Replace Phase 0 bash hook:** Handle `UserPromptSubmit` and `PostToolUse` hooks in sidecar, log to `/v1/guard/input` and `/v1/guard/output` (same format as original hook).
+2. **Tool gating via PreToolUse:** Intercept tool execution, run L1 check + check session state, return ALLOW/BLOCK before tool executes.
+3. **Session state machine:** Track conversation state (clean → caution → tainted) based on detection signals. Boost risk scoring for risky prompts in tainted sessions.
+4. **Local L1 heuristics:** Run pattern matching locally. Fast path: <10ms decision for obvious attacks without network.
+5. **VGE fallback:** For borderline L1 cases, async POST to VGE for semantic/llm-guard analysis (non-blocking).
+6. **Configuration UI:** `vge-cc-guard config` TUI lets users enable/disable features, set thresholds, choose which tools are gatable.
+7. **Graceful degradation:** If VGE unreachable, sidecar falls back to L1-only decisions (no blocking of Claude Code).
 
 ### 3.2 Non-Goals
 
@@ -169,11 +168,6 @@ vge-cc-guard sidecar (single process, TypeScript + Node.js or Rust)
     │  ├─ Per-session thresholds (from config)
     │  └─ Transitions: clean →(suspicious prompt) caution →(injection detected) tainted
     │
-    ├─ Policy Engine
-    │  ├─ Fetch /v1/policies periodically
-    │  ├─ Parse rule templates (L1 patterns, thresholds, tool blocklist)
-    │  └─ Hot-reload on update
-    │
     ├─ VGE Client
     │  ├─ Async POST /v1/guard/input for borderline prompts
     │  ├─ Cached L2 results (5 min TTL)
@@ -201,7 +195,6 @@ vge-agent-guard/
 │   │   ├── http-server.ts                        # Listener for hook endpoints
 │   │   ├── l1-engine.ts                          # Pattern matching, heuristics
 │   │   ├── session-state.ts                      # State machine
-│   │   ├── policy-engine.ts                      # Rule loading + hot-reload
 │   │   ├── vge-client.ts                         # VGE communication
 │   │   └── audit-logger.ts                       # Decision logging
 │   │
@@ -214,14 +207,12 @@ vge-agent-guard/
 ├── tests/
 │   ├── l1-engine.test.ts
 │   ├── session-state.test.ts
-│   ├── policy-engine.test.ts
 │   └── integration/
 │       └── claude-code-integration.test.ts
 │
 ├── docs/
 │   ├── INSTALLATION.md                           # How to install Phase 1
-│   ├── ARCHITECTURE.md                           # Deep dive on state machine
-│   └── POLICY_FORMAT.md                          # Rule template syntax
+│   └── ARCHITECTURE.md                           # Deep dive on state machine
 │
 └── .github/workflows/
     └── npm-publish.yml                           # Build + publish to npm
@@ -231,7 +222,7 @@ vge-agent-guard/
 ```bash
 npm install -g vge-cc-guard
 vge-cc-guard install      # Installs hooks in ~/.claude/settings.json
-vge-cc-guard config       # TUI to configure thresholds, tool blocklist
+vge-cc-guard config       # TUI to configure tool policies
 vge-cc-guard daemon       # Starts the sidecar (runs in background)
 ```
 
@@ -239,31 +230,38 @@ vge-cc-guard daemon       # Starts the sidecar (runs in background)
 
 ## 6. Phase 1 Implementation Phases (Sub-phases)
 
-### 6.1 Phase 1a — MVP: PreToolUse Gating (2-3 weeks)
+### 6.1 Phase 1a — MVP: Full Sidecar with Tool Gating (3-4 weeks)
 
-**Minimal viable product: tool blocking based on L1 + simple state.**
+**Minimal viable product: Phase 0 logging + PreToolUse gating.**
 
-- [ ] HTTP sidecar skeleton (Node.js + Express or Rust)
-- [ ] L1 engine: 50 regex patterns from VGE (basic SQL injection, command injection, etc.)
-- [ ] Session state: clean/tainted, simple threshold-based transitions
-- [ ] PreToolUse endpoint: return ALLOW/BLOCK based on L1 + state
+- [ ] HTTP sidecar (Node.js + Express)
+- [ ] UserPromptSubmit hook handler → POST `/v1/guard/input` (Phase 0 func)
+- [ ] PostToolUse hook handler → POST `/v1/guard/output` (Phase 0 func)
+- [ ] L1 engine: 50 regex patterns (SQL injection, command injection, etc.)
+- [ ] Session state machine: clean → caution → tainted
+- [ ] PreToolUse hook handler → return ALLOW/BLOCK (gating decision)
+  - Check L1 + session state
+  - Boost threshold if session tainted
 - [ ] Config: environment variables (no TUI yet)
-- [ ] Tests: unit tests for L1, integration test with Claude Code
-- [ ] Acceptance: PreToolUse latency p99 < 50ms, no false positives on benign tools
+- [ ] Tests: unit tests for L1, session state, integration test with Claude Code
+- [ ] Acceptance: PreToolUse latency p99 < 50ms, UserPromptSubmit async non-blocking, no false positives
 
-### 6.2 Phase 1b — VGE Integration (2 weeks)
+### 6.2 Phase 1b — Resilience & Observability (1-2 weeks)
 
-- [ ] VGE client: async POST to /v1/guard/input for borderline cases
-- [ ] Caching: 5-min TTL for L2 results
-- [ ] Policy fetch: /v1/policies endpoint + hot-reload
-- [ ] Audit logging: flush decisions to /v1/audit/events
-- [ ] Acceptance: operator can push rules, sidecar reloads without restart
+- [ ] Error handling: VGE unreachable → fallback to L1-only decisions (no BLOCK timeout)
+- [ ] Caching: 5-min TTL for VGE L2 results (for borderline L1 cases)
+- [ ] Local debug logging: structured JSON logs (phase, decision, latency, scores)
+  - Log rotation: max 50MB per file, keep 5 last files
+- [ ] Connection retry: exponential backoff for VGE POST (3 retries, max 5s total)
+- [ ] Tests: error path testing, cache hit/miss scenarios
+- [ ] Acceptance: sidecar survives 10-minute VGE outage without crashing, all decisions logged locally
 
 ### 6.3 Phase 1c — Polish (1-2 weeks)
 
 - [ ] TUI: `vge-cc-guard config` for settings
 - [ ] Error handling: graceful degradation (L1 only if VGE down)
-- [ ] Observability: structured logs, metrics (latency, decision rate)
+- [ ] Local debug logging: structured logs for troubleshooting (JSON to file)
+  - Log rotation: max 50MB per file, keep 5 last files, auto-delete old logs
 - [ ] Installer: `vge-cc-guard install` sets up ~/.claude/settings.json
 - [ ] Acceptance: e2e test with real Claude Code session
 
@@ -332,13 +330,12 @@ vge-cc-guard daemon       # Starts the sidecar (runs in background)
 1. **PreToolUse latency:** p99 < 50ms (local decision without VGE roundtrip).
 2. **False-positive rate:** < 2% on benign prompts (measured against Pangea dataset).
 3. **False-negative rate:** < 15% on injection attempts (within L1 capability; L2 catches the rest).
-4. **Policy hot-reload:** operator pushes rule update, sidecar reloads within 30 seconds without restarting.
-5. **Session state transitions:** clear documentation + unit tests for clean → caution → tainted flows.
-6. **Tool gating:** BLOCK decision is honored (no tool execution); ALLOW lets tool run.
-7. **Audit logging:** all decisions logged locally + flushed to VGE within 10 seconds.
-8. **Graceful degradation:** if VGE unreachable, sidecar falls back to L1 only (does not crash).
-9. **Installer:** `vge-cc-guard install` successfully sets up both Phase 0 (hook) and Phase 1 (sidecar) in one command.
-10. **Documentation:** installation, configuration, troubleshooting, policy format all documented.
+4. **Session state transitions:** clear documentation + unit tests for clean → caution → tainted flows.
+5. **Tool gating:** BLOCK decision is honored (no tool execution); ALLOW lets tool run.
+6. **Audit logging:** all decisions logged locally + flushed to VGE within 10 seconds.
+7. **Graceful degradation:** if VGE unreachable, sidecar falls back to L1 only (does not crash).
+8. **Installer:** `vge-cc-guard install` successfully sets up both Phase 0 (hook) and Phase 1 (sidecar) in one command.
+9. **Documentation:** installation, configuration, troubleshooting all documented.
 
 ---
 
@@ -346,11 +343,10 @@ vge-cc-guard daemon       # Starts the sidecar (runs in background)
 
 | Milestone | Duration | Deliverable |
 |-----------|----------|-------------|
-| **ADR-0001 finalized** | 1 week | Language decision (TS or Rust) |
-| **Phase 1a (MVP)** | 2–3 weeks | PreToolUse gating working |
-| **Phase 1b (VGE)** | 2 weeks | Policies, caching, audit logging |
-| **Phase 1c (Polish)** | 1–2 weeks | TUI, installer, observability |
-| **Phase 1 release** | 6–8 weeks total | `v1.0.0` tag |
+| **Phase 1a (MVP)** | 3–4 weeks | Phase 0 logging + PreToolUse gating + session state |
+| **Phase 1b (Resilience)** | 1–2 weeks | Error handling, caching, log rotation, retry logic |
+| **Phase 1c (Polish)** | 1–2 weeks | TUI, installer, E2E test |
+| **Phase 1 release** | 5–8 weeks total | `v1.0.0` tag |
 
 ---
 
@@ -385,9 +381,6 @@ No changes needed on VGE side. Phase 1 sidecar:
 
 3. **VGE API key distribution:** Should sidecar use same key as Phase 0, or separate sidecar-only key?
    - Current thinking: share `~/.claude/.env` key; Phase 1 installer migrates Phase 0 credentials.
-
-4. **L1 pattern update frequency:** How often does sidecar fetch `/v1/policies`?
-   - Current thinking: 60-second polling; manual refresh on `vge-cc-guard reload` command.
 
 ---
 
