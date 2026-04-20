@@ -170,41 +170,52 @@ jq empty ~/.claude/settings.json && echo "JSON OK"
 
 If `jq empty` errors, restore from `.bak` and try again.
 
-### Step 3 — Configure credentials (per project)
+### Step 3 — Configure credentials (user-level, shared by all projects)
 
-Create `.claude/.env` in **each project** where you want to use vg-cc:
+The hook works **everywhere automatically** once you configure user-level credentials:
+
+```bash
+mkdir -p ~/.claude
+cat > ~/.claude/.env <<'ENV'
+VGE_API_URL=https://api.vigilguard
+VGE_API_KEY=vg_test_YOUR_KEY_HERE
+VGE_TIMEOUT_SECONDS=5
+ENV
+chmod 600 ~/.claude/.env
+```
+
+**That's it.** From now on, every project you open in Claude Code will use these credentials. No per-project configuration needed.
+
+**Credential precedence (highest wins):**
+1. Shell `export VGE_API_KEY=...` — overrides all files
+2. `$CLAUDE_PROJECT_DIR/.claude/.env` — project-specific override (optional, see Advanced section below)
+3. `~/.claude/.env` — user fallback (universal, used by all projects)
+
+### Step 4 — (Optional) Per-Project Override
+
+If a specific project needs **different credentials** (e.g., prod API key), create a project-specific `.env`:
 
 ```bash
 mkdir -p <project>/.claude
 cat > <project>/.claude/.env <<'ENV'
 VGE_API_URL=https://api.vigilguard
-VGE_API_KEY=vg_test_YOUR_KEY_HERE
+VGE_API_KEY=vg_live_DIFFERENT_KEY_FOR_PROD
 ENV
 chmod 600 <project>/.claude/.env
 ```
 
-**Example for test playground:**
-```bash
-mkdir -p ~/Development/test/.claude
-cat > ~/Development/test/.claude/.env <<'ENV'
-VGE_API_URL=https://api.vigilguard
-VGE_API_KEY=vg_test_OMHLNHkxlyXamLM9p9ODUemA6JCcgi3u
-ENV
-chmod 600 ~/Development/test/.claude/.env
-```
-
-**Precedence (highest wins):**
-1. `$CLAUDE_PROJECT_DIR/.claude/.env` — project-specific (per project)
-2. `~/.claude/.env` — user fallback (optional, for default credentials)
-3. Shell `export` — overrides both files
+The hook will use **this** key for that project, and fall back to `~/.claude/.env` for all others.
 
 **For version control:**
 ```bash
 # Ignore real credentials
 echo '.claude/.env' >> <project>/.gitignore
 
-# Commit template with placeholders
-cp vg-cc/config/.env.example <project>/.claude/.env.example
+# (Optional) Commit template with placeholders
+cat > <project>/.claude/.env.example <<'ENV'
+VGE_API_URL=https://api.vigilguard
+VGE_API_KEY=vg_live_YOUR_KEY_HERE
+ENV
 git add <project>/.claude/.env.example
 git commit -m "docs: add .env template for vg-cc"
 ```
@@ -227,14 +238,13 @@ git commit -m "docs: add .env template for vg-cc"
 | `VGE_LOG_FILE` | no | `/tmp/vge-prompt-logger.log` | Debug log path |
 | `VGE_DRY_RUN` | no | `0` | `1` = dry-run (no HTTP) |
 
-### Step 4 — Verify (One-time)
+### Step 5 — Verify Installation (One-time)
 
-**Test the installation:**
+**Test with dry-run (no network):**
 
 ```bash
-# Test with dry-run (no network)
-cd ~/Development/test
-export CLAUDE_PROJECT_DIR=~/Development/test
+# Test from any project directory
+export CLAUDE_PROJECT_DIR=$PWD
 echo '{"session_id":"verify","prompt_id":"p-verify","hook_event_name":"UserPromptSubmit","prompt":"test","transcript_path":""}' \
   | VGE_DRY_RUN=1 ~/.claude/vg-cc/user-prompt-submit.sh
 
@@ -247,7 +257,7 @@ tail -f /tmp/vge-prompt-logger.log
 
 ```bash
 # Reload Claude Code or restart the app
-# Open ~/Development/test in Claude Code
+# Open any project in Claude Code
 # Submit a prompt in the chat
 
 # Check log (should show status=200)
