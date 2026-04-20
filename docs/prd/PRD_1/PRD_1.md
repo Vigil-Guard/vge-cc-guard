@@ -188,20 +188,28 @@ vge-guard sidecar (single process, TypeScript + Node.js or Rust)
 
 ## 5. Phase 1 Deliverables
 
+**npm package: `vge-guard`** (published to npm registry)
+
 ```
 vge-agent-guard/
-├── src/                                          # New: sidecar source
-│   ├── sidecar.ts (or .rs)                       # Main entry point
-│   ├── http-server.ts                            # Listener for hook endpoints
-│   ├── l1-engine.ts                              # Pattern matching, heuristics
-│   ├── session-state.ts                          # State machine
-│   ├── policy-engine.ts                          # Rule loading + hot-reload
-│   ├── vge-client.ts                             # VGE communication
-│   └── audit-logger.ts                           # Decision logging
+├── package.json                                  # npm package metadata
+│   └── "bin": { "vge-guard": "dist/cli.js" }   # CLI entry point
+│
+├── src/
+│   ├── cli.ts                                    # `vge-guard install` / `config` / `daemon`
+│   ├── daemon/
+│   │   ├── http-server.ts                        # Listener for hook endpoints
+│   │   ├── l1-engine.ts                          # Pattern matching, heuristics
+│   │   ├── session-state.ts                      # State machine
+│   │   ├── policy-engine.ts                      # Rule loading + hot-reload
+│   │   ├── vge-client.ts                         # VGE communication
+│   │   └── audit-logger.ts                       # Decision logging
+│   │
+│   └── tui/
+│       └── config-ui.ts                          # `vge-guard config` TUI
 │
 ├── config/
-│   ├── default-policies.json                     # Default L1 rules
-│   └── cli.ts                                    # `vge-guard config` TUI
+│   └── default-policies.json                     # Default L1 rules (bundled)
 │
 ├── tests/
 │   ├── l1-engine.test.ts
@@ -216,7 +224,15 @@ vge-agent-guard/
 │   └── POLICY_FORMAT.md                          # Rule template syntax
 │
 └── .github/workflows/
-    └── release.yml                               # Build + release sidecar binary
+    └── npm-publish.yml                           # Build + publish to npm
+```
+
+**Installation for users:**
+```bash
+npm install -g vge-guard
+vge-guard install      # Installs hooks in ~/.claude/settings.json
+vge-guard config       # TUI to configure thresholds, tool blocklist
+vge-guard daemon       # Starts the sidecar (runs in background)
 ```
 
 ---
@@ -255,15 +271,39 @@ vge-agent-guard/
 
 ## 7. Phase 1 Design Decisions
 
-### 7.1 Language Choice
+### 7.1 Language Choice — TypeScript (Node.js) ✅ DECIDED
 
-**Pending ADR-0001.**
+**Decision:** TypeScript + Node.js via npm distribution.
 
-Options:
-- **TypeScript (Node.js):** Fast to iterate, reuses npm ecosystem, easier testing. Downside: ~50MB binary, startup latency.
-- **Rust:** Small binary, fast startup, memory-safe. Downside: longer implementation, smaller team expertise.
+**Rationale:**
+1. **npm distribution** (critical advantage):
+   - `npm install -g vge-guard` — single command, works everywhere
+   - Auto cross-platform (macOS, Linux, Windows, Docker)
+   - Easy updates (`npm update -g`)
+   - Aligns with VGE team's package ecosystem
 
-**Current assumption:** TypeScript until ADR-0001 is finalized; can be rewritten in Rust later if performance critical.
+2. **Consistency with VGE:**
+   - VGE codebase entirely in TypeScript
+   - Team expertise already present
+   - Easier code sharing and maintenance
+
+3. **Latency (50ms p99 achievable):**
+   - Sidecar is separate Node.js process (isolated from VGE API)
+   - Tunable GC: fixed heap size, manual GC triggers
+   - Node.js flags: `--max-old-space-size=512 --expose-gc`
+   - Expected latency: 20-40ms typical, <50ms p99
+
+4. **Development speed:**
+   - Fast iteration (not slower than VGE development)
+   - Rich npm ecosystem (vitest, pino, express, regexp-tree)
+   - Familiar testing patterns
+
+**Alternatives rejected:**
+- **Go:** Would require separate binary distribution (GitHub releases, homebrew, apt) — too complex for npm-based workflow
+- **Rust:** Best performance, but 2-3x slower development; npm distribution not idiomatic
+- **Python:** Latency 300-500ms — exceeds 50ms requirement
+
+**Implementation:** Start Phase 1a with TypeScript. If GC latency proves problematic, can optimize with native modules (node-regex, re2) or later rewrite L1 engine in Rust with FFI.
 
 ### 7.2 L1 Heuristics (Safe Patterns Only)
 
