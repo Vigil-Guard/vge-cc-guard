@@ -64,8 +64,17 @@ raw_input="$(cat || true)"
 session_id="$(printf '%s' "$raw_input" | jq -r '.session_id // ""' 2>/dev/null || echo "")"
 prompt_id="$(printf '%s' "$raw_input" | jq -r '.prompt_id // ""' 2>/dev/null || echo "")"
 hook_event="$(printf '%s' "$raw_input" | jq -r '.hook_event_name // "UserPromptSubmit"' 2>/dev/null || echo "UserPromptSubmit")"
-prompt_text="$(printf '%s' "$raw_input" | jq -r '.prompt // ""' 2>/dev/null || echo "")"
 transcript_path="$(printf '%s' "$raw_input" | jq -r '.transcript_path // ""' 2>/dev/null || echo "")"
+
+# Extract content based on event type: prompt for UserPromptSubmit, tool_response for PostToolUse
+case "$hook_event" in
+  PostToolUse)
+    prompt_text="$(printf '%s' "$raw_input" | jq -r '.tool_response // ""' 2>/dev/null || echo "")"
+    ;;
+  *)
+    prompt_text="$(printf '%s' "$raw_input" | jq -r '.prompt // ""' 2>/dev/null || echo "")"
+    ;;
+esac
 
 [ -z "$prompt_id" ] && prompt_id="pid_$(uuidgen 2>/dev/null || date +%s%N)"
 idem="idem_${prompt_id}"

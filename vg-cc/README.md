@@ -304,6 +304,34 @@ User opens Claude Code in project/
               └─ Data appears in VGE Investigation tab
 ```
 
+### Tool Output Analysis (PostToolUse)
+
+When Claude Code executes a tool (Read, Bash, etc.), the hook also fires after tool completion:
+
+```
+Tool execution completes
+        │
+        └─ CC fires PostToolUse hook
+           │
+           ├─ Executes: ~/.claude/vg-cc/user-prompt-submit.sh
+           │
+           ├─ Extracts:
+           │  - tool response (output)
+           │  - tool name + metadata
+           │  - original user prompt (for context)
+           │  - session ID
+           │
+           ├─ Builds payload for /v1/guard/output
+           │
+           └─ POSTs tool output for injection detection
+              └─ Detects if tool response contains prompt injection attempts
+```
+
+**Note:** PostToolUse analyzes the **tool response**, not the tool's action. For example:
+- `Read` tool: analyzes file contents (not the read operation itself)
+- `Bash` tool: analyzes command output/stderr (not the command execution)
+- Tool response is extracted from `.tool_response` field in the hook input
+
 ### Multiple Projects (Same Machine)
 
 Imagine you have two projects:
@@ -382,6 +410,8 @@ No other files are modified. The hook writes only to `$VGE_LOG_FILE` (default `/
 | Self-signed cert (local dev stack) | Export `CURL_CA_BUNDLE=""` in the dev shell only — never in production; or add the local CA to your system trust store |
 | Claude Code feels sluggish | Set `VGE_TIMEOUT_SECONDS=2` in `.env`; the hook is fail-open so network latency cannot actually block CC, but the 5 s default is the worst-case wait per prompt |
 | Want to see what would be sent without posting | `VGE_DRY_RUN=1` in `.env` |
+| PostToolUse events firing twice | Check `~/.claude/settings.json` — PostToolUse should be registered ONLY at user level, not in `project/.claude/settings.json`; remove project-level hook registration if present |
+| PostToolUse `output` field is empty | Verify hook was updated to v1.1+ (reads `.tool_response` not `.prompt`); if upgrading from earlier version, re-copy: `cp vg-cc/hooks/user-prompt-submit.sh ~/.claude/vg-cc/` |
 
 **Log file contents** — the script logs timestamp, hook event, HTTP status, session ID, and truncation flag. It never logs prompt text, API keys, or transcript paths.
 
