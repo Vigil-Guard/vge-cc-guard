@@ -1,17 +1,61 @@
 # vg-cc — VGE logger for Claude Code
 
-Drops one `UserPromptSubmit` hook into Claude Code that forwards every user prompt to Vigil Guard Enterprise (VGE) for detection logging.
+Hooks Claude Code prompts and tool responses into Vigil Guard Enterprise (VGE) for detection logging. **Universal installation** — install once in `~/.claude/`, works everywhere automatically.
 
-- **Phase 0 (current):** logs every user prompt via `/v1/guard/input` — one row per prompt in VGE `events_v2` with session/prompt IDs, framework `claude-code`, and full detection result (heuristics + semantic + llm-guard + PII).
-- **What it does not do:** no enforcement, no tool gating, no session state, no BLOCK. Fire-and-forget advisory only.
-- **Audit events deferred:** tool calls, session lifecycle (PreToolUse, PostToolUse, SessionStart, etc.) are deferred to Phase 1 pending VGE pipeline refinement. Current `/v1/guard/analyze` routing causes false BLOCK decisions on benign audit events and adds unnecessary load.
-- **Safety:** always exits 0. A crashed, unreachable, or rate-limited VGE never blocks Claude Code.
+**Phase 0 (current):**
+- Logs every user prompt via `/v1/guard/input` — one row per prompt in VGE `events_v2`
+- Logs every tool response via `/v1/guard/output` — for output injection detection
+- Captures framework, session, prompt ID, hook event, tool context, and conversation digest
+- Results: VGE Investigation tab shows all events (framework = `claude-code`)
+
+**What it does NOT do:** no enforcement, no tool gating, no BLOCK. Fire-and-forget advisory only.
+
+**Safety:** always exits 0 (fail-open). Network errors, invalid credentials, or VGE downtime never blocks Claude Code.
+
+---
+
+## Architecture
+
+```
+┌─────────────────┐
+│  Claude Code    │  Runs in any project directory
+└────────┬────────┘
+         │ (CC sets CLAUDE_PROJECT_DIR automatically)
+         ▼
+┌─────────────────────────────────────────┐
+│  ~/.claude/vg-cc/user-prompt-submit.sh  │  ← UNIVERSAL hook (ONE copy)
+│  ~/.claude/settings.json                │  ← UNIVERSAL registration
+└────────────────┬────────────────────────┘
+                 │ Loads project-specific .env
+                 ▼
+        ┌────────────────────┐
+        │ $CLAUDE_PROJECT_DIR│  ← From CC environment
+        │/.claude/.env       │     (e.g., ~/Development/test/.claude/.env)
+        │                    │
+        │ VGE_API_URL        │
+        │ VGE_API_KEY        │
+        └────────┬───────────┘
+                 │
+                 ▼
+        ┌────────────────────┐
+        │  VGE API           │
+        │  /v1/guard/input   │  ← User prompts
+        │  /v1/guard/output  │  ← Tool responses
+        └────────────────────┘
+                 │
+                 ▼
+        ┌────────────────────┐
+        │  VGE Database      │
+        │  events_v2         │
+        │  (Investigation UI)│
+        └────────────────────┘
+```
 
 ---
 
 ## Prerequisites
 
-- `bash` ≥ 3.2 (macOS default) or ≥ 4.0 (Linux)
+- `bash` ≥ 3.2 (macOS) or ≥ 4.0 (Linux)
 - `jq` — JSON parsing
 - `curl` — HTTP client
 
@@ -23,15 +67,16 @@ brew install jq
 sudo apt-get install -y jq curl
 ```
 
-A running VGE you can reach over HTTPS, and a functional API key (`vg_live_...` or `vg_test_...`).
+- VGE running and accessible over HTTPS
+- API key: `vg_live_...` or `vg_test_...`
 
 ---
 
-## Install
+## Installation (Universal)
 
-Four steps. Everything is manual and reversible — no installer to run.
+**Three steps.** One-time setup; works in all projects forever.
 
-### Step 1 — copy the hook script
+### Step 1 — Install hook script globally
 
 ```bash
 mkdir -p ~/.claude/vg-cc
@@ -39,43 +84,41 @@ cp vg-cc/hooks/user-prompt-submit.sh ~/.claude/vg-cc/
 chmod +x ~/.claude/vg-cc/user-prompt-submit.sh
 ```
 
-The hook lives in `~/.claude/vg-cc/` so all Claude Code profiles share it. If you prefer a project-local copy, put it anywhere under your project and use an absolute path in Step 2.
+This is the **only copy** you'll ever need. It applies to all projects.
 
-### Step 2 — register the hook in Claude Code settings
+### Step 2 — Register hook in user-level settings
 
-Claude Code reads hooks from one of three files. Pick the scope you want:
-
-| Scope | File | Effect |
-|-------|------|--------|
-| **User (all sessions, all projects)** | `~/.claude/settings.json` | Every CC session logs prompts |
-| **Project (shared with team)** | `<repo>/.claude/settings.json` | Only this repo logs; committed to git |
-| **Project (private, per-developer)** | `<repo>/.claude/settings.local.json` | Only your clone logs; gitignored |
-
-The merge rules below apply identically to all three files.
-
-**Back up first:**
-
-```bash
-cp ~/.claude/settings.json ~/.claude/settings.json.bak 2>/dev/null || true
-```
-
-**Case A — target file does not exist yet:** create it with the snippet verbatim.
+Edit `~/.claude/settings.json` (create if missing):
 
 ```bash
 cat > ~/.claude/settings.json <<'JSON'
 {
   "hooks": {
     "UserPromptSubmit": [
-      { "type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh" }
+      { "matcher": "", "hooks": [{ "type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "", "hooks": [{ "type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh" }] }
     ]
   }
 }
 JSON
 ```
 
-**Case B — target file exists with other content.** Open it in your editor and merge *only* the `hooks.UserPromptSubmit` entry. Preserve everything else (skills, MCP servers, permissions, env, other hooks).
+**If `~/.claude/settings.json` already exists** with other content, merge only the `hooks` section:
 
-Example starting point — `settings.json` already has a `PreToolUse` hook and no `UserPromptSubmit`:
+```bash
+jq '.hooks.UserPromptSubmit = [{"matcher": "", "hooks": [{"type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh"}]}] | .hooks.PostToolUse = [{"matcher": "", "hooks": [{"type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh"}]}]' ~/.claude/settings.json > /tmp/settings.tmp && mv /tmp/settings.tmp ~/.claude/settings.json
+```
+
+Verify the merge:
+
+```bash
+jq '.hooks | keys' ~/.claude/settings.json
+# Should show: ["PostToolUse", "UserPromptSubmit"]
+```
+
+### Step 3 — Configure credentials per project
 
 ```json
 {
@@ -127,126 +170,203 @@ jq empty ~/.claude/settings.json && echo "JSON OK"
 
 If `jq empty` errors, restore from `.bak` and try again.
 
-### Step 3 — configure VGE credentials via `.env`
+### Step 3 — Configure credentials (per project)
 
-The script auto-loads `.env` files. Precedence (highest wins):
-
-1. `$CLAUDE_PROJECT_DIR/.claude/.env` — project-scoped (CC sets this var)
-2. `~/.claude/.env` — user-scoped
-3. Shell environment — wins when a variable is already exported before the hook runs
-
-**Create the file:**
+Create `.claude/.env` in **each project** where you want to use vg-cc:
 
 ```bash
-mkdir -p ~/.claude
-cp vg-cc/config/.env.example ~/.claude/.env
-chmod 600 ~/.claude/.env
-```
-
-Edit `~/.claude/.env` and fill in real values:
-
-```bash
+mkdir -p <project>/.claude
+cat > <project>/.claude/.env <<'ENV'
 VGE_API_URL=https://api.vigilguard
-VGE_API_KEY=vg_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+VGE_API_KEY=vg_test_YOUR_KEY_HERE
+ENV
+chmod 600 <project>/.claude/.env
 ```
 
-**File format rules** (enforced by the parser — the script does *not* `source` the file):
-
-- One `KEY=value` per line
-- Keys match `^[A-Z_][A-Z0-9_]*$`; anything else is skipped
-- Values: plain or `"quoted"` / `'quoted'` (surrounding quotes are stripped); no `$VAR` / `$(cmd)` / `` `cmd` `` expansion — everything is literal
-- `#` at column 0 is a comment; inline `#` is part of the value
-- `export KEY=value` works but the `export ` prefix is ignored
-
-**For project-scoped `.env`, add it to `.gitignore`:**
-
+**Example for test playground:**
 ```bash
-echo '.claude/.env' >> .gitignore
+mkdir -p ~/Development/test/.claude
+cat > ~/Development/test/.claude/.env <<'ENV'
+VGE_API_URL=https://api.vigilguard
+VGE_API_KEY=vg_test_OMHLNHkxlyXamLM9p9ODUemA6JCcgi3u
+ENV
+chmod 600 ~/Development/test/.claude/.env
 ```
 
-To share a template in git, commit `.claude/.env.example` with placeholders and keep the real `.env` ignored.
+**Precedence (highest wins):**
+1. `$CLAUDE_PROJECT_DIR/.claude/.env` — project-specific (per project)
+2. `~/.claude/.env` — user fallback (optional, for default credentials)
+3. Shell `export` — overrides both files
 
-**Full environment variable reference:**
+**For version control:**
+```bash
+# Ignore real credentials
+echo '.claude/.env' >> <project>/.gitignore
+
+# Commit template with placeholders
+cp vg-cc/config/.env.example <project>/.claude/.env.example
+git add <project>/.claude/.env.example
+git commit -m "docs: add .env template for vg-cc"
+```
+
+**Env file rules** (no shell expansion):
+- One `KEY=value` per line
+- Keys: `^[A-Z_][A-Z0-9_]*$`
+- Values: literal (no `$VAR`, no `$(cmd)`, no backticks)
+- Quotes (`"..."` or `'...'`) are stripped
+- `#` at column 0 = comment
+
+**Environment variables:**
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
-| `VGE_API_URL` | no | `https://api.vigilguard` | VGE base URL |
-| `VGE_API_KEY` | yes | — | Bearer token, `vg_(live\|test)_...` |
-| `VGE_TIMEOUT_SECONDS` | no | `5` | Per-request timeout, capped at 10 |
+| `VGE_API_KEY` | ✅ yes | — | Bearer token `vg_live_*` or `vg_test_*` |
+| `VGE_API_URL` | no | `https://api.vigilguard` | VGE endpoint |
+| `VGE_TIMEOUT_SECONDS` | no | `5` | Request timeout (max 10) |
 | `VGE_WIRE_FORMAT` | no | `auto` | `auto` / `typed` / `legacy` |
-| `VGE_LOG_FILE` | no | `/tmp/vge-prompt-logger.log` | Local diagnostic log; set to `/dev/null` to disable |
-| `VGE_DRY_RUN` | no | `0` | `1` = log payload and skip HTTP |
+| `VGE_LOG_FILE` | no | `/tmp/vge-prompt-logger.log` | Debug log path |
+| `VGE_DRY_RUN` | no | `0` | `1` = dry-run (no HTTP) |
 
-### Step 4 — verify
+### Step 4 — Verify (One-time)
 
-**Dry run** — no HTTP request, payload written to log:
+**Test the installation:**
 
 ```bash
-echo '{"session_id":"test-s","prompt_id":"test-p","hook_event_name":"UserPromptSubmit","prompt":"hello"}' \
+# Test with dry-run (no network)
+cd ~/Development/test
+export CLAUDE_PROJECT_DIR=~/Development/test
+echo '{"session_id":"verify","prompt_id":"p-verify","hook_event_name":"UserPromptSubmit","prompt":"test","transcript_path":""}' \
   | VGE_DRY_RUN=1 ~/.claude/vg-cc/user-prompt-submit.sh
 
-tail -n 5 /tmp/vge-prompt-logger.log
+# Check log
+tail -f /tmp/vge-prompt-logger.log
+# Expected: DRY_RUN status + payload with key redacted as "vg_***"
 ```
 
-Expect two lines starting with `DRY_RUN` — one summary, one payload. The API key must appear as `vg_***`.
+**Test live (with VGE):**
 
-**Live run:**
+```bash
+# Reload Claude Code or restart the app
+# Open ~/Development/test in Claude Code
+# Submit a prompt in the chat
 
-1. Reload Claude Code (new session, or close and reopen the app).
-2. Submit any prompt.
-3. Tail the log:
+# Check log (should show status=200)
+tail -f /tmp/vge-prompt-logger.log
+# Expected: INFO status=200 event=UserPromptSubmit session=...
+```
 
-   ```bash
-   tail -f /tmp/vge-prompt-logger.log
-   ```
+**Verify in VGE:**
 
-   Expect one `INFO status=200 event=UserPromptSubmit session=<uuid>` line per submitted prompt.
+```sql
+SELECT 
+  timestamp, 
+  agent_framework, 
+  agent_hook_event,
+  decision, 
+  threat_score 
+FROM vigil.events_v2
+WHERE agent_framework = 'claude-code'
+ORDER BY timestamp DESC
+LIMIT 10;
+```
 
-4. Confirm in VGE (Web UI → Investigation tab, filter by framework = `claude-code`), or directly:
-
-   ```sql
-   SELECT timestamp, decision, threat_score, agent_session_id
-   FROM vigil.events_v2
-   WHERE agent_framework = 'claude-code'
-   ORDER BY timestamp DESC
-   LIMIT 5;
-   ```
+Or in Web UI: **Investigation → filter `framework = claude-code`**
 
 ---
 
-## Coexistence — what this hook will NOT touch
+## How It Works
 
-vg-cc is deliberately additive. It registers only the `UserPromptSubmit` hook event and intentionally defers all audit-only events (PreToolUse, PostToolUse, SessionStart, SessionEnd, etc.) to Phase 1.
+### Event Flow
 
-It does not edit:
+```
+User opens Claude Code in project/
+        │
+        ├─ CC sets CLAUDE_PROJECT_DIR=project/
+        │
+        ├─ User submits prompt
+        │
+        └─ CC fires UserPromptSubmit hook
+           │
+           ├─ Executes: ~/.claude/vg-cc/user-prompt-submit.sh
+           │
+           ├─ Loads project/.claude/.env (VGE credentials)
+           │
+           ├─ Builds JSON payload with:
+           │  - prompt text
+           │  - agent framework (claude-code)
+           │  - session ID (from CC)
+           │  - conversation digest (last 10 messages)
+           │
+           ├─ POSTs to /v1/guard/input
+           │
+           └─ Logs result (status=200, timestamp, event, session)
+              │
+              └─ Data appears in VGE Investigation tab
+```
 
-- `CLAUDE.md` (user or project) — hooks run from `settings.json`, not CLAUDE.md
-- `.claude/skills/` — no skill is installed or invoked
-- `.claude/commands/` — no slash commands
-- `.claude/agents/` — no subagents
-- `.mcp.json` / `mcpServers` — MCP stays untouched
-- `permissions` — the hook runs via the CC harness; it is not a tool call and needs no allowlist entry
-- Any hook event other than `UserPromptSubmit` (these remain available for other tooling)
+### Multiple Projects (Same Machine)
 
-Safe to drop into projects with heavy existing CC configuration (Lasso, custom linters, multi-MCP servers, project skills).
+Imagine you have two projects:
+
+```
+~/.claude/vg-cc/user-prompt-submit.sh      ← ONE hook, shared by all projects
+
+~/Development/test/.claude/.env            ← Test API key (test VGE instance)
+  VGE_API_KEY=vg_test_...
+
+~/Development/prod/.claude/.env            ← Prod API key (production VGE)
+  VGE_API_KEY=vg_live_...
+```
+
+**How it works:**
+1. Open `~/Development/test` in CC → hook loads `test/.claude/.env` → events go to test VGE
+2. Open `~/Development/prod` in CC → hook loads `prod/.claude/.env` → events go to prod VGE
+3. Hook script is the same for both — only credentials differ
+
+This is the **universal design** — one installation, many projects.
+
+### Persistence (Session Resets)
+
+All files are on disk and **persist across CC restarts**:
+
+```
+~/.claude/vg-cc/user-prompt-submit.sh  ← Persists (one-time install)
+~/.claude/settings.json                 ← Persists (one-time registration)
+~/Development/test/.claude/.env         ← Persists (per-project)
+```
+
+**No re-installation needed** — close CC, restart, open any project, hook fires automatically.
+
+---
+
+## Coexistence
+
+vg-cc is **deliberately additive**:
+
+- Registers only `UserPromptSubmit` and `PostToolUse` events
+- Defers all other CC hook events for future phases
+- Does NOT modify: CLAUDE.md, `.claude/skills/`, `.claude/commands/`, `.claude/agents/`, `.mcp.json`, `permissions`, git state, or shell config
+- Safe alongside Lasso, custom linters, multi-MCP, project skills, and other CC configuration
 
 ---
 
 ## Uninstall
 
 ```bash
-# 1. Remove the UserPromptSubmit entry from settings.json (restore backup or edit by hand)
-cp ~/.claude/settings.json.bak ~/.claude/settings.json   # if you kept the backup
-# ...or edit and remove just the VGE line from hooks.UserPromptSubmit
-
-# 2. Delete the hook
+# Remove hook from all projects
 rm -rf ~/.claude/vg-cc
 
-# 3. (Optional) remove credentials
+# Remove hook registration from user settings
+jq 'del(.hooks.UserPromptSubmit, .hooks.PostToolUse)' ~/.claude/settings.json > /tmp/settings.tmp && mv /tmp/settings.tmp ~/.claude/settings.json
+
+# (Optional) Remove user-level fallback env
 rm ~/.claude/.env
+
+# Note: Project-specific ~/.claude/.env files in each project are left untouched
+#       (they're gitignored, so harmless if left)
 ```
 
-No other cleanup needed. The script writes only to `$VGE_LOG_FILE` and never modifies your shell, CC config, or git state.
+No other files are modified. The hook writes only to `$VGE_LOG_FILE` (default `/tmp/vge-prompt-logger.log`).
 
 ---
 
