@@ -157,7 +157,7 @@ build_payload() {
   local original_prompt="$3"
 
   if [ "$endpoint" = "/v1/guard/output" ]; then
-    # /v1/guard/output format: output (tool response) + original_prompt (context)
+    # /v1/guard/output format: output + original_prompt + metadata only (no agent/tool at top level)
     jq -n \
       --arg output "$prompt_text" \
       --arg orig_prompt "$original_prompt" \
@@ -168,12 +168,8 @@ build_payload() {
       --arg mode "$mode" '
       {output: $output}
       + (if ($orig_prompt | length) > 0 then {original_prompt: $orig_prompt} else {} end)
-      + (if $mode == "typed" or $mode == "auto"
-         then {agent: {framework: "claude-code", sessionId: $sid, promptId: $pid, hookEvent: $ev}}
-         else {} end)
-      + (if $tool != null then {tool: $tool} else {} end)
-      + {metadata: {platform: "claude-code", session_id: $sid, prompt_id: $pid, hookEvent: $ev}
-                   + (if $tool != null and $tool.name != null then {tool_name: $tool.name} else {} end)}
+      + {metadata: {platform: "claude-code", session_id: $sid, prompt_id: $pid, hook_event: $ev}
+                   + (if $tool != null and $tool.name != null then {tool_name: $tool.name, tool_id: ($tool.id // "")} else {} end)}
     '
   else
     # /v1/guard/input format: prompt + agent/tool/conversation context
