@@ -13,12 +13,13 @@ Command: `vge-cc-guard config` — interactive terminal UI for API keys and poli
 │          MAIN MENU                      │
 │                                         │
 │  ▶ API Keys Configuration               │
-│    Block Handling Policy                │
+│    Tools Policy (NEW)                   │
+│    VGE Decision Handling                │
 │    Advanced Settings (Phase 2)          │
 │    View Current Config                  │
 │    Exit                                 │
 └─────────────────────────────────────────┘
-         ↓ (select)
+         ↓ (select API Keys)
 ┌─────────────────────────────────────────┐
 │      API KEYS CONFIGURATION             │
 │                                         │
@@ -149,19 +150,71 @@ Or error:
   Check your API key in VGE Web UI → API Keys
 ```
 
-### 2.3 Block Handling Policy Screen
+### 2.3 Tools Policy Screen (NEW — Dynamic Tool Configuration)
 
-**Decision:** When BLOCK signal received from VGE, how to handle:
+**Scan available tools** in the repo and allow user to configure each one.
+
+Sources for tool discovery:
+- Built-in Claude Code tools (Read, Write, Bash, Edit, Glob, Grep, Agent, etc.)
+- Custom MCP tools (from `.mcp.json` or `.claude/.mcp.json`)
+- Installed plugins/skills (from `~/.claude/agents/`, `~/.claude/skills/`)
+
+```
+┌──────────────────────────────────────────────────────┐
+│  TOOLS POLICY CONFIGURATION                          │
+│                                                      │
+│  Detected tools in this repo: 12                     │
+│  Scanning: ~/.mcp.json, .claude/.mcp.json, ...       │
+│                                                      │
+│  Configure each tool action:                         │
+│  [block] [allow] [ask]                               │
+│                                                      │
+│  ▶ HIGH-RISK TOOLS (6)                               │
+│    ├─ [block]  Bash (command execution)              │
+│    ├─ [block]  Write (file creation)                 │
+│    ├─ [block]  Edit (file modification)              │
+│    ├─ [block]  Agent (spawn agents)                  │
+│    ├─ [ask  ]  Task (background tasks)               │
+│    └─ [block]  Python (code execution)               │
+│                                                      │
+│  ▼ MEDIUM-RISK TOOLS (3)                             │
+│    ├─ [allow]  Read (file reading)                   │
+│    ├─ [allow]  Glob (file search)                    │
+│    └─ [allow]  Grep (code search)                    │
+│                                                      │
+│  ▼ LOW-RISK TOOLS (2)                                │
+│    ├─ [allow]  WebFetch (HTTP get)                   │
+│    └─ [allow]  WebSearch (search)                    │
+│                                                      │
+│  ▼ CUSTOM TOOLS (1)                                  │
+│    └─ [ask  ]  my-custom-mcp (unknown risk)          │
+│                                                      │
+│  ┌────────────┬──────────┬───────────┐               │
+│  │[Save]      │[Reset]   │[Cancel]   │               │
+│  └────────────┴──────────┴───────────┘               │
+│                                                      │
+│  Navigation: ↑↓ select | [space] toggle | ESC quit   │
+└──────────────────────────────────────────────────────┘
+```
+
+**Tool Actions:**
+- `[block]` — Tool does NOT execute; user sees "Tool blocked"
+- `[allow]` — Tool executes immediately (no check)
+- `[ask]` — Show popup: user decides [Allow] [Block] [Report]
+
+### 2.4 Block Handling Policy Screen (for VGE decisions)
+
+**Decision:** When VGE returns BLOCK decision, how to enforce:
 
 ```
 ┌──────────────────────────────────────────────┐
-│  BLOCK HANDLING POLICY                       │
+│  VGE DECISION HANDLING                       │
 │                                              │
-│  What happens when VGE returns BLOCK?        │
+│  When VGE detects prompt injection:          │
 │                                              │
 │  ○ Auto-block (recommended)                  │
 │    Immediately block tool execution          │
-│    User sees: "Tool blocked: [reason]"       │
+│    User sees: "Tool blocked: injection"      │
 │    No prompt, no wait time                   │
 │                                              │
 │  ○ Human-in-the-loop                         │
@@ -240,9 +293,23 @@ Stored in `~/.vge-cc-guard/config.json` (readable by vge-cc-guard daemon):
     "api_key_output": null,
     "verified_at": "2026-04-20T20:15:33Z"
   },
+  "tools": {
+    "Bash": "block",
+    "Write": "block",
+    "Edit": "block",
+    "Agent": "block",
+    "Task": "ask",
+    "Read": "allow",
+    "Glob": "allow",
+    "Grep": "allow",
+    "WebFetch": "allow",
+    "WebSearch": "allow",
+    "my-custom-mcp": "ask"
+  },
   "policy": {
-    "block_handling": "auto-block",
-    "human_timeout_seconds": 30
+    "vge_block_handling": "auto-block",
+    "human_timeout_seconds": 30,
+    "unknown_tool_default": "ask"
   },
   "advanced": {
     "log_level": "info",
@@ -252,8 +319,14 @@ Stored in `~/.vge-cc-guard/config.json` (readable by vge-cc-guard daemon):
 ```
 
 **Notes:**
+- `tools.<tool_name>`: one of `"block"`, `"allow"`, `"ask"`
+  - `"block"`: Tool does NOT execute; blocked message shown
+  - `"allow"`: Tool executes immediately (no check)
+  - `"ask"`: Show popup to user for manual decision (with timeout)
+- `unknown_tool_default`: What to do with newly discovered custom tools (default: `"ask"`)
+- `vge_block_handling`: When VGE returns BLOCK decision (separate from tool-level policies)
 - `api_key_output`: if null, daemon uses `api_key_input` for both input and output
-- `verified_at`: timestamp of last successful connection test
+- `verified_at`: timestamp of last successful VGE connection test
 - All keys stored plaintext (file permission 0600)
 
 ### 3.2 Runtime Config Resolution
@@ -394,7 +467,63 @@ form.addButton({ text: 'Save', ... });
 
 **Preference:** Ink (modern, React-like, easier to reason about)
 
-### 5.2 File Storage
+### 5.2 Tool Discovery & Scanning
+
+**How configurator finds available tools:**
+
+1. **Built-in Claude Code tools** (hardcoded list)
+   ```typescript
+   const builtInTools = [
+     { name: 'Bash', risk: 'high', description: 'command execution' },
+     { name: 'Read', risk: 'low', description: 'file reading' },
+     { name: 'Write', risk: 'high', description: 'file creation' },
+     { name: 'Edit', risk: 'high', description: 'file modification' },
+     { name: 'Glob', risk: 'low', description: 'file search' },
+     { name: 'Grep', risk: 'low', description: 'code search' },
+     { name: 'Agent', risk: 'high', description: 'spawn agents' },
+     { name: 'Task', risk: 'medium', description: 'background tasks' },
+     { name: 'WebFetch', risk: 'low', description: 'HTTP get' },
+     { name: 'WebSearch', risk: 'low', description: 'search' },
+     // ... more tools
+   ];
+   ```
+
+2. **Scan for custom MCP tools** (in order of precedence)
+   ```
+   1. project/.claude/.mcp.json
+   2. project/.mcp.json
+   3. ~/.claude/.mcp.json (user-level)
+   4. ~/.mcp.json
+   ```
+   
+   Parse JSON:
+   ```json
+   {
+     "mcpServers": {
+       "my-custom-tool": {
+         "command": "node",
+         "args": ["server.js"],
+         "description": "Custom analysis tool"
+       }
+     }
+   }
+   ```
+   
+   Extract tool names + risk assessment (default: "unknown" → "ask")
+
+3. **Scan for installed plugins/skills** (in `~/.claude/agents/`, `~/.claude/skills/`)
+   ```
+   ~/.claude/agents/my-agent.ts → tool name: "my-agent"
+   ~/.claude/skills/my-skill.ts → tool name: "my-skill"
+   ```
+
+**Risk categorization:**
+- `high`: Bash, Write, Edit, Agent, Task, Python, etc.
+- `medium`: Read (with restrictions), Glob, Agent spawning
+- `low`: WebFetch, WebSearch, Query tools
+- `unknown`: Custom MCP tools (default to "ask")
+
+### 5.3 File Storage
 
 - **Location:** `~/.vge-cc-guard/config.json`
 - **Permissions:** `0600` (readable/writable by user only)
