@@ -1,199 +1,139 @@
-# vg-cc — VGE logger for Claude Code
+# vge-cc-guard — Prompt Injection Detection Sidecar for Claude Code
 
-Hooks Claude Code prompts and tool responses into Vigil Guard Enterprise (VGE) for detection logging. **Universal installation** — install once in `~/.claude/`, works everywhere automatically.
+Native TypeScript sidecar for Claude Code that logs prompts/responses to VGE and gates tool execution based on injection risk. **Tool gating + session state tracking + local L1 heuristics.**
 
-**Phase 0 (current):**
-- Logs every user prompt via `/v1/guard/input` — one row per prompt in VGE `events_v2`
-- Logs every tool response via `/v1/guard/output` — for output injection detection
-- Captures framework, session, prompt ID, hook event, tool context, and conversation digest
-- Results: VGE Investigation tab shows all events (framework = `claude-code`)
+**Install once** → works in all Claude Code projects. One command: `npm install -g vge-cc-guard`
 
-**What it does NOT do:** no enforcement, no tool gating, no BLOCK. Fire-and-forget advisory only.
+---
 
-**Safety:** always exits 0 (fail-open). Network errors, invalid credentials, or VGE downtime never blocks Claude Code.
+## What It Does
+
+**Phase 1 (MVP):**
+- ✅ **Logs prompts & responses** → POST `/v1/guard/input` (UserPromptSubmit) + `/v1/guard/output` (PostToolUse) to VGE
+- ✅ **Gates tool execution** → `PreToolUse` hook → return ALLOW/BLOCK based on L1 check + session state
+- ✅ **Session state tracking** → clean → caution → tainted (boosts risk threshold if session compromised)
+- ✅ **L1 heuristics locally** → fast pattern matching (<50ms) for obvious attacks
+- ✅ **Graceful VGE failover** → if VGE unreachable, falls back to L1-only (never blocks Claude Code)
+- ✅ **Local debug logging** → JSON logs with log rotation (50MB max per file, keep 5 last)
+- ✅ **TUI configurator** → `vge-cc-guard config` for API keys and tool policies
+
+**What it does NOT do:** 
+- No custom rule scripting
+- No session correlation (Phase 2)
+- No observability/metrics (VGE already logs everything)
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────┐
-│  Claude Code    │  Runs in any project directory
-└────────┬────────┘
-         │ (CC sets CLAUDE_PROJECT_DIR automatically)
-         ▼
-┌─────────────────────────────────────────┐
-│  ~/.claude/vg-cc/user-prompt-submit.sh  │  ← UNIVERSAL hook (ONE copy)
-│  ~/.claude/settings.json                │  ← UNIVERSAL registration
-└────────────────┬────────────────────────┘
-                 │ Loads project-specific .env
-                 ▼
-        ┌────────────────────┐
-        │ $CLAUDE_PROJECT_DIR│  ← From CC environment
-        │/.claude/.env       │     (e.g., ~/Development/test/.claude/.env)
-        │                    │
-        │ VGE_API_URL        │
-        │ VGE_API_KEY        │
-        └────────┬───────────┘
-                 │
-                 ▼
-        ┌────────────────────┐
-        │  VGE API           │
-        │  /v1/guard/input   │  ← User prompts
-        │  /v1/guard/output  │  ← Tool responses
-        └────────────────────┘
-                 │
-                 ▼
-        ┌────────────────────┐
-        │  VGE Database      │
-        │  events_v2         │
-        │  (Investigation UI)│
-        └────────────────────┘
+Claude Code session
+    │
+    ├─ UserPromptSubmit hook
+    │  └─ vge-cc-guard sidecar (daemon)
+    │     ├─ Extract prompt + agent info
+    │     ├─ POST /v1/guard/input (VGE logging)
+    │     └─ Update session state
+    │
+    ├─ PostToolUse hook
+    │  └─ vge-cc-guard sidecar
+    │     ├─ Extract tool response + context
+    │     ├─ POST /v1/guard/output (VGE analysis)
+    │     └─ Update session state
+    │
+    └─ PreToolUse hook (SYNC gating)
+       └─ vge-cc-guard sidecar
+          ├─ Run L1 heuristics (50ms)
+          ├─ Check session state (tainted → boost threshold)
+          └─ Return {"decision": "ALLOW" | "BLOCK"}
+             └─ Claude Code gates tool execution
+
+Session State Machine
+    clean (score: 0-39)
+      ↓ (suspicious prompt detected)
+    caution (score: 40-79, threshold boosted)
+      ↓ (injection confirmed)
+    tainted (score: 80+, all thresholds boosted)
 ```
 
 ---
 
 ## Prerequisites
 
-- `bash` ≥ 3.2 (macOS) or ≥ 4.0 (Linux)
-- `jq` — JSON parsing
-- `curl` — HTTP client
-
-```bash
-# macOS
-brew install jq
-
-# Debian/Ubuntu
-sudo apt-get install -y jq curl
-```
-
+- **Node.js** 18+ (for sidecar daemon)
+- **npm** (or yarn/pnpm)
 - VGE running and accessible over HTTPS
 - API key: `vg_live_...` or `vg_test_...`
 
 ---
 
-## Installation (Universal)
+## Installation
 
-**Three steps.** One-time setup; works in all projects forever.
+**Three steps. One-time setup; works everywhere.**
 
-### Step 1 — Install hook script globally
+### Step 1 — Install npm package
 
 ```bash
-mkdir -p ~/.claude/vg-cc
-cp vg-cc/hooks/user-prompt-submit.sh ~/.claude/vg-cc/
-chmod +x ~/.claude/vg-cc/user-prompt-submit.sh
+npm install -g vge-cc-guard
 ```
 
-This is the **only copy** you'll ever need. It applies to all projects.
-
-### Step 2 — Register hook in user-level settings
-
-Edit `~/.claude/settings.json` (create if missing):
+### Step 2 — Initialize sidecar
 
 ```bash
-cat > ~/.claude/settings.json <<'JSON'
+vge-cc-guard install
+```
+
+This registers the sidecar hooks in `~/.claude/settings.json`:
+- `UserPromptSubmit` → sidecar HTTP endpoint
+- `PostToolUse` → sidecar HTTP endpoint
+- `PreToolUse` → sidecar HTTP endpoint (gating decision)
+
+Starts daemon in background (port 9090, Unix socket).
+
+### Step 3 — Configure credentials
+
+```bash
+mkdir -p ~/.vge-cc-guard
+cat > ~/.vge-cc-guard/config.json <<'JSON'
 {
-  "hooks": {
-    "UserPromptSubmit": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh" }] }
-    ],
-    "PostToolUse": [
-      { "matcher": "", "hooks": [{ "type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh" }] }
-    ]
+  "version": "1.0.0",
+  "vge": {
+    "api_url": "https://api.vigilguard",
+    "api_key_input": "vg_test_YOUR_KEY_HERE",
+    "api_key_output": null
+  },
+  "tools": {
+    "Bash": "block",
+    "Write": "block",
+    "Edit": "block",
+    "Read": "allow",
+    "Glob": "allow",
+    "Grep": "allow"
+  },
+  "policy": {
+    "vge_block_handling": "auto-block",
+    "unknown_tool_default": "ask"
   }
 }
 JSON
+chmod 600 ~/.vge-cc-guard/config.json
 ```
 
-**If `~/.claude/settings.json` already exists** with other content, merge only the `hooks` section:
+Or use interactive TUI:
 
 ```bash
-jq '.hooks.UserPromptSubmit = [{"matcher": "", "hooks": [{"type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh"}]}] | .hooks.PostToolUse = [{"matcher": "", "hooks": [{"type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh"}]}]' ~/.claude/settings.json > /tmp/settings.tmp && mv /tmp/settings.tmp ~/.claude/settings.json
+vge-cc-guard config
 ```
-
-Verify the merge:
-
-```bash
-jq '.hooks | keys' ~/.claude/settings.json
-# Should show: ["PostToolUse", "UserPromptSubmit"]
-```
-
-### Step 3 — Configure credentials per project
-
-```json
-{
-  "permissions": { "allow": ["Bash(git status:*)"] },
-  "hooks": {
-    "PreToolUse": [
-      { "type": "command", "command": "/usr/local/bin/my-lint.sh" }
-    ]
-  }
-}
-```
-
-After merge:
-
-```json
-{
-  "permissions": { "allow": ["Bash(git status:*)"] },
-  "hooks": {
-    "PreToolUse": [
-      { "type": "command", "command": "/usr/local/bin/my-lint.sh" }
-    ],
-    "UserPromptSubmit": [
-      { "type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh" }
-    ]
-  }
-}
-```
-
-**Case C — target file already has `UserPromptSubmit` entries** (Lasso `claude-hooks`, custom tooling, other VGE hooks). Append, do not replace. Hooks run in array order:
-
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      { "type": "command", "command": "/path/to/your/existing-hook.sh" },
-      { "type": "command", "command": "$HOME/.claude/vg-cc/user-prompt-submit.sh" }
-    ]
-  }
-}
-```
-
-Put the VGE hook last so your existing hooks run untouched.
-
-**Validate the merged JSON before reloading CC:**
-
-```bash
-jq empty ~/.claude/settings.json && echo "JSON OK"
-```
-
-If `jq empty` errors, restore from `.bak` and try again.
-
-### Step 3 — Configure credentials (user-level, shared by all projects)
-
-The hook works **everywhere automatically** once you configure user-level credentials:
-
-```bash
-mkdir -p ~/.claude
-cat > ~/.claude/.env <<'ENV'
-VGE_API_URL=https://api.vigilguard
-VGE_API_KEY=vg_test_YOUR_KEY_HERE
-VGE_TIMEOUT_SECONDS=5
-ENV
-chmod 600 ~/.claude/.env
-```
-
-**That's it.** From now on, every project you open in Claude Code will use these credentials. No per-project configuration needed.
 
 **Credential precedence (highest wins):**
-1. Shell `export VGE_API_KEY=...` — overrides all files
-2. `$CLAUDE_PROJECT_DIR/.claude/.env` — project-specific override (optional, see Advanced section below)
-3. `~/.claude/.env` — user fallback (universal, used by all projects)
+1. Shell `export VGE_API_KEY=...`
+2. `$CLAUDE_PROJECT_DIR/.claude/.env` — project-specific override
+3. `~/.vge-cc-guard/config.json` — user default
+4. `~/.claude/.env` — fallback (legacy)
 
 ### Step 4 — (Optional) Per-Project Override
 
-If a specific project needs **different credentials** (e.g., prod API key), create a project-specific `.env`:
+If a project needs different credentials (test vs prod):
 
 ```bash
 mkdir -p <project>/.claude
@@ -204,76 +144,27 @@ ENV
 chmod 600 <project>/.claude/.env
 ```
 
-The hook will use **this** key for that project, and fall back to `~/.claude/.env` for all others.
+### Step 5 — Verify Installation
 
-**For version control:**
+**Check sidecar health:**
 ```bash
-# Ignore real credentials
-echo '.claude/.env' >> <project>/.gitignore
-
-# (Optional) Commit template with placeholders
-cat > <project>/.claude/.env.example <<'ENV'
-VGE_API_URL=https://api.vigilguard
-VGE_API_KEY=vg_live_YOUR_KEY_HERE
-ENV
-git add <project>/.claude/.env.example
-git commit -m "docs: add .env template for vg-cc"
+curl http://localhost:9090/health
+# Expected: {"status":"healthy","version":"1.0.0"}
 ```
 
-**Env file rules** (no shell expansion):
-- One `KEY=value` per line
-- Keys: `^[A-Z_][A-Z0-9_]*$`
-- Values: literal (no `$VAR`, no `$(cmd)`, no backticks)
-- Quotes (`"..."` or `'...'`) are stripped
-- `#` at column 0 = comment
-
-**Environment variables:**
-
-| Variable | Required | Default | Purpose |
-|----------|----------|---------|---------|
-| `VGE_API_KEY` | ✅ yes | — | Bearer token `vg_live_*` or `vg_test_*` |
-| `VGE_API_URL` | no | `https://api.vigilguard` | VGE endpoint |
-| `VGE_TIMEOUT_SECONDS` | no | `5` | Request timeout (max 10) |
-| `VGE_WIRE_FORMAT` | no | `auto` | `auto` / `typed` / `legacy` |
-| `VGE_LOG_FILE` | no | `/tmp/vge-prompt-logger.log` | Debug log path |
-| `VGE_DRY_RUN` | no | `0` | `1` = dry-run (no HTTP) |
-
-### Step 5 — Verify Installation (One-time)
-
-**Test with dry-run (no network):**
-
+**Test with dry-run:**
 ```bash
-# Test from any project directory
-export CLAUDE_PROJECT_DIR=$PWD
-echo '{"session_id":"verify","prompt_id":"p-verify","hook_event_name":"UserPromptSubmit","prompt":"test","transcript_path":""}' \
-  | VGE_DRY_RUN=1 ~/.claude/vg-cc/user-prompt-submit.sh
-
-# Check log
-tail -f /tmp/vge-prompt-logger.log
-# Expected: DRY_RUN status + payload with key redacted as "vg_***"
+VGE_DRY_RUN=1 vge-cc-guard test
 ```
 
-**Test live (with VGE):**
-
+**Check logs:**
 ```bash
-# Reload Claude Code or restart the app
-# Open any project in Claude Code
-# Submit a prompt in the chat
-
-# Check log (should show status=200)
-tail -f /tmp/vge-prompt-logger.log
-# Expected: INFO status=200 event=UserPromptSubmit session=...
+tail -f ~/.vge-cc-guard/debug.log
 ```
 
 **Verify in VGE:**
-
 ```sql
-SELECT 
-  timestamp, 
-  agent_framework, 
-  agent_hook_event,
-  decision, 
-  threat_score 
+SELECT timestamp, agent_framework, agent_hook_event, decision, threat_score
 FROM vigil.events_v2
 WHERE agent_framework = 'claude-code'
 ORDER BY timestamp DESC
@@ -286,125 +177,129 @@ Or in Web UI: **Investigation → filter `framework = claude-code`**
 
 ## How It Works
 
-### Event Flow
+### Event Flow (UserPromptSubmit + PreToolUse Gating)
 
 ```
-User opens Claude Code in project/
-        │
-        ├─ CC sets CLAUDE_PROJECT_DIR=project/
-        │
-        ├─ User submits prompt
-        │
-        └─ CC fires UserPromptSubmit hook
-           │
-           ├─ Executes: ~/.claude/vg-cc/user-prompt-submit.sh
-           │
-           ├─ Loads project/.claude/.env (VGE credentials)
-           │
-           ├─ Builds JSON payload with:
-           │  - prompt text
-           │  - agent framework (claude-code)
-           │  - session ID (from CC)
-           │  - conversation digest (last 10 messages)
-           │
-           ├─ POSTs to /v1/guard/input
-           │
-           └─ Logs result (status=200, timestamp, event, session)
-              │
-              └─ Data appears in VGE Investigation tab
+User submits prompt in Claude Code
+    │
+    ├─ CC fires UserPromptSubmit hook
+    │  └─ Sidecar receives: {prompt, session_id, prompt_id, agent_context}
+    │     ├─ L1 check (50ms)
+    │     ├─ Update session state (clean/caution/tainted)
+    │     └─ Async POST /v1/guard/input (non-blocking)
+    │
+    ├─ User requests tool execution (e.g., Bash)
+    │  └─ CC fires PreToolUse hook (synchronous)
+    │     └─ Sidecar returns {"decision": "ALLOW" | "BLOCK"}
+    │        ├─ If session is TAINTED: boost threshold (lower tolerance)
+    │        ├─ If ALLOW: CC executes tool
+    │        └─ If BLOCK: CC shows "Tool blocked: injection detected"
+    │
+    └─ Tool completes
+       └─ CC fires PostToolUse hook
+          └─ Sidecar receives: {tool_response, tool_name, tool_id}
+             ├─ L1 check on output
+             ├─ Update session state
+             └─ Async POST /v1/guard/output (non-blocking)
 ```
 
-### Tool Output Analysis (PostToolUse)
-
-When Claude Code executes a tool (Read, Bash, etc.), the hook also fires after tool completion:
+### Session State Boost Example
 
 ```
-Tool execution completes
-        │
-        └─ CC fires PostToolUse hook
-           │
-           ├─ Executes: ~/.claude/vg-cc/user-prompt-submit.sh
-           │
-           ├─ Extracts:
-           │  - tool response (output)
-           │  - tool name + metadata
-           │  - original user prompt (for context)
-           │  - session ID
-           │
-           ├─ Builds payload for /v1/guard/output
-           │
-           └─ POSTs tool output for injection detection
-              └─ Detects if tool response contains prompt injection attempts
+Prompt 1: "hello, how are you?"
+  L1 score: 10 (safe)
+  Session: clean
+  Decision: ALLOW
+
+Prompt 2: "'; DROP TABLE users; --"
+  L1 score: 95 (SQL injection)
+  Session → TAINTED
+  Decision: BLOCK ✅
+
+Prompt 3: "read /etc/passwd"
+  L1 score: 35 (normally safe)
+  Session: TAINTED (from Prompt 2)
+  Score × tainted_boost (1.5): 35 × 1.5 = 52.5
+  Threshold: 40 → BLOCK ✅ (even though L1 < threshold)
 ```
 
-**Note:** PostToolUse analyzes the **tool response**, not the tool's action. For example:
-- `Read` tool: analyzes file contents (not the read operation itself)
-- `Bash` tool: analyzes command output/stderr (not the command execution)
-- Tool response is extracted from `.tool_response` field in the hook input
-
-### Multiple Projects (Same Machine)
-
-Imagine you have two projects:
-
-```
-~/.claude/vg-cc/user-prompt-submit.sh      ← ONE hook, shared by all projects
-
-~/Development/test/.claude/.env            ← Test API key (test VGE instance)
-  VGE_API_KEY=vg_test_...
-
-~/Development/prod/.claude/.env            ← Prod API key (production VGE)
-  VGE_API_KEY=vg_live_...
-```
-
-**How it works:**
-1. Open `~/Development/test` in CC → hook loads `test/.claude/.env` → events go to test VGE
-2. Open `~/Development/prod` in CC → hook loads `prod/.claude/.env` → events go to prod VGE
-3. Hook script is the same for both — only credentials differ
-
-This is the **universal design** — one installation, many projects.
-
-### Persistence (Session Resets)
-
-All files are on disk and **persist across CC restarts**:
-
-```
-~/.claude/vg-cc/user-prompt-submit.sh  ← Persists (one-time install)
-~/.claude/settings.json                 ← Persists (one-time registration)
-~/Development/test/.claude/.env         ← Persists (per-project)
-```
-
-**No re-installation needed** — close CC, restart, open any project, hook fires automatically.
+Without session tracking: Prompt 3 would ALLOW.
+With session tracking: Prompt 3 is BLOCKED because session is compromised.
 
 ---
 
-## Coexistence
+## Configuration
 
-vg-cc is **deliberately additive**:
+### API Keys
 
-- Registers only `UserPromptSubmit` and `PostToolUse` events
-- Defers all other CC hook events for future phases
-- Does NOT modify: CLAUDE.md, `.claude/skills/`, `.claude/commands/`, `.claude/agents/`, `.mcp.json`, `permissions`, git state, or shell config
-- Safe alongside Lasso, custom linters, multi-MCP, project skills, and other CC configuration
+| Field | Required | Default | Purpose |
+|-------|----------|---------|---------|
+| `vge.api_url` | no | `https://api.vigilguard` | VGE endpoint |
+| `vge.api_key_input` | ✅ yes | — | Bearer token for UserPromptSubmit |
+| `vge.api_key_output` | no | (uses input key) | Separate token for tool responses |
+
+### Tool Policies
+
+Configure per-tool action:
+
+| Action | Behavior |
+|--------|----------|
+| `"allow"` | Tool always executes (no L1 check) |
+| `"block"` | Tool always blocked (gated) |
+| `"ask"` | Show popup to user (timeout: 30s default) |
+
+Built-in tool categories:
+- **High-risk:** Bash, Write, Edit, Agent, Python
+- **Medium-risk:** Task, Read
+- **Low-risk:** Glob, Grep, WebFetch, WebSearch
+- **Unknown:** Custom MCP tools (default: `"ask"`)
 
 ---
 
-## Uninstall
+## Local Debug Logging
+
+Logs written to `~/.vge-cc-guard/debug.log`:
+
+```json
+{
+  "timestamp": "2026-04-20T15:32:45.123Z",
+  "hook_event": "PreToolUse",
+  "tool_name": "Bash",
+  "l1_score": 75,
+  "session_state": "caution",
+  "final_decision": "BLOCK",
+  "latency_ms": 42
+}
+```
+
+**Log Rotation:**
+- Max 50MB per file
+- Keep 5 last files
+- Auto-delete logs older than 7 days
+
+---
+
+## Commands
 
 ```bash
-# Remove hook from all projects
-rm -rf ~/.claude/vg-cc
+# Install sidecar hooks + start daemon
+vge-cc-guard install
 
-# Remove hook registration from user settings
-jq 'del(.hooks.UserPromptSubmit, .hooks.PostToolUse)' ~/.claude/settings.json > /tmp/settings.tmp && mv /tmp/settings.tmp ~/.claude/settings.json
+# Interactive configuration TUI
+vge-cc-guard config
 
-# (Optional) Remove user-level fallback env
-rm ~/.claude/.env
+# Start daemon (runs on port 9090)
+vge-cc-guard daemon
 
-# Note: Project-specific ~/.claude/.env files in each project are left untouched
-#       (they're gitignored, so harmless if left)
+# Check sidecar health
+vge-cc-guard health
+
+# View recent logs
+vge-cc-guard logs [lines]
+
+# Uninstall
+vge-cc-guard uninstall
 ```
-
-No other files are modified. The hook writes only to `$VGE_LOG_FILE` (default `/tmp/vge-prompt-logger.log`).
 
 ---
 
@@ -412,47 +307,51 @@ No other files are modified. The hook writes only to `$VGE_LOG_FILE` (default `/
 
 | Symptom | Check |
 |---------|-------|
-| No events appear in VGE | `tail ~/VGE_LOG_FILE path` — look for non-200 status, `connection refused`, or missing key warning |
-| `WARN VGE_API_KEY missing` | `.env` not loaded — check `chmod 600 ~/.claude/.env` and `KEY=value` syntax; try `VGE_API_KEY=vg_... ~/.claude/vg-cc/user-prompt-submit.sh <<< '{}'` as a one-off |
-| HTTP `401` | Key revoked or wrong environment; verify in VGE Web UI → API Keys |
-| HTTP `400` | Pre-PRD_29 VGE build — try `VGE_WIRE_FORMAT=legacy` in `.env` |
-| HTTP `000` | Connectivity failure (DNS, TLS, timeout) — check `VGE_API_URL` and network |
-| Self-signed cert (local dev stack) | Export `CURL_CA_BUNDLE=""` in the dev shell only — never in production; or add the local CA to your system trust store |
-| Claude Code feels sluggish | Set `VGE_TIMEOUT_SECONDS=2` in `.env`; the hook is fail-open so network latency cannot actually block CC, but the 5 s default is the worst-case wait per prompt |
-| Want to see what would be sent without posting | `VGE_DRY_RUN=1` in `.env` |
-| PostToolUse events firing twice | Check `~/.claude/settings.json` — PostToolUse should be registered ONLY at user level, not in `project/.claude/settings.json`; remove project-level hook registration if present |
-| PostToolUse `output` field is empty | Verify hook was updated to v1.1+ (reads `.tool_response` not `.prompt`); if upgrading from earlier version, re-copy: `cp vg-cc/hooks/user-prompt-submit.sh ~/.claude/vg-cc/` |
-
-**Log file contents** — the script logs timestamp, hook event, HTTP status, session ID, and truncation flag. It never logs prompt text, API keys, or transcript paths.
+| Tool always blocked | Check `tools` policy in config; verify L1 patterns not over-aggressive |
+| No events in VGE | Check `vge.api_key_input` format; run `vge-cc-guard test`; check sidecar logs |
+| Sidecar crashes | Check `~/.vge-cc-guard/debug.log` for errors; ensure Node.js 18+ installed |
+| High latency on PreToolUse | L1 engine too slow; check sidecar resource usage; consider reducing pattern count |
+| Session state stuck in TAINTED | Manual reset: `vge-cc-guard reset-session` or restart Claude Code |
 
 ---
 
-## Compatibility matrix
+## Uninstall
 
-| VGE build | Behavior |
-|-----------|----------|
-| Pre-PRD_28 | `prompt` reaches detection branches; `metadata` stored as `clientMetadata`; no `agentContext` enrichment |
-| PRD_28 (alias path) | `metadata.session_id` / `prompt_id` lifted into `arbiter_json.agentContext` |
-| Post-PRD_29 (typed) | `agent.*` is the primary source; flat columns `agent_session_id`, `agent_framework`, `hook_event` populate; SIEM CEF carries them |
+```bash
+# Remove hooks from settings
+vge-cc-guard uninstall
 
-No migration needed on your side when VGE upgrades — the script emits both wire formats and VGE picks whichever is authoritative for the running build.
+# Remove daemon + logs
+rm -rf ~/.vge-cc-guard
+
+# Remove npm package
+npm uninstall -g vge-cc-guard
+```
 
 ---
 
-## Roadmap to Phase 1
+## Timeline
 
-Phase 0 (current):
-- ✅ UserPromptSubmit → `/v1/guard/input` (full detection, logging)
-- ⏸ Audit events deferred pending VGE pipeline updates to avoid false BLOCKs
+| Phase | Duration | What |
+|-------|----------|------|
+| **1a** | 3–4 weeks | UserPromptSubmit + PostToolUse logging + PreToolUse gating + L1 engine + session state |
+| **1b** | 1–2 weeks | Error handling, caching, log rotation, retry logic |
+| **1c** | 1–2 weeks | TUI configurator, installer, E2E tests |
+| **Release** | ~8 weeks | `v1.0.0` |
 
-Phase 1:
-- Audit events (PreToolUse, PostToolUse, SessionStart, SessionEnd, Stop, etc.) routed to refined `/v1/guard/analyze` pipeline or dedicated `/v1/guard/audit` endpoint
-- Optional tool gating via PostToolUse (ALLOW/BLOCK decision gates tool execution)
-- Session-level state tracking and risk scoring
-- Full sidecar integration with CC's built-in event hooks
+---
 
-When Phase 1 ships:
-- Merge the sidecar's hook line into your `settings.json` (one-line change alongside vg-cc's UserPromptSubmit).
-- The VGE wire format is identical — no server-side change.
+## Roadmap (Phase 2+)
 
-Users in constrained environments (CI runners, shared dev boxes, no local sidecar) can keep vg-cc indefinitely.
+- [ ] OTel observability (latency histograms, decision counters)
+- [ ] Multi-session correlation (replay detection)
+- [ ] Custom rule templates (community-curated patterns)
+- [ ] Webhook notifications (Slack on BLOCK)
+- [ ] Session persistence (survived restarts)
+- [ ] Web UI (alternative to TUI)
+
+---
+
+**Docs:** [PRD_1.md](docs/prd/PRD_1/PRD_1.md) | **Architecture:** [docs/architecture/](docs/architecture/)
+
+**VGE:** [api.vigilguard](https://api.vigilguard) | **GitHub:** [Vigil-Guard/vge-cc-guard](https://github.com/Vigil-Guard/vge-cc-guard)
