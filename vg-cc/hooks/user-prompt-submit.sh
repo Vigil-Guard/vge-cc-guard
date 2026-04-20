@@ -157,19 +157,26 @@ build_payload() {
   local original_prompt="$3"
 
   if [ "$endpoint" = "/v1/guard/output" ]; then
-    # /v1/guard/output format: output + original_prompt + metadata only (no agent/tool at top level)
+    # /v1/guard/output format: output + originalPrompt + agent/tool/conversation context
     jq -n \
       --arg output "$prompt_text" \
       --arg orig_prompt "$original_prompt" \
       --arg sid "$session_id" \
       --arg pid "$prompt_id" \
       --arg ev "$hook_event" \
+      --argjson trunc "$truncated" \
+      --argjson conv "$conversation_json" \
       --argjson tool "$tool_json" \
       --arg mode "$mode" '
       {output: $output}
-      + (if ($orig_prompt | length) > 0 then {original_prompt: $orig_prompt} else {} end)
-      + {metadata: {platform: "claude-code", session_id: $sid, prompt_id: $pid, hook_event: $ev}
-                   + (if $tool != null and $tool.name != null then {tool_name: $tool.name, tool_id: ($tool.id // "")} else {} end)}
+      + (if ($orig_prompt | length) > 0 then {originalPrompt: $orig_prompt} else {} end)
+      + (if $mode == "typed" or $mode == "auto"
+         then {agent: {framework: "claude-code", sessionId: $sid, promptId: $pid, hookEvent: $ev}}
+         else {} end)
+      + (if $tool != null then {tool: $tool} else {} end)
+      + (if ($conv | length) > 0 then {conversation: $conv} else {} end)
+      + {metadata: {platform: "claude-code", session_id: $sid, prompt_id: $pid, hookEvent: $ev}
+                   + (if $trunc then {vge_prompt_truncated: true} else {} end)}
     '
   else
     # /v1/guard/input format: prompt + agent/tool/conversation context
