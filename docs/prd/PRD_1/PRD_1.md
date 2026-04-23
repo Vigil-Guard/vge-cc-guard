@@ -3,6 +3,7 @@
 **Status:** In Planning (Phase 0 complete, Phase 1 design in progress)  
 **Author:** Tomasz Bartel  
 **Created:** 2026-04-20  
+**Updated:** 2026-04-23  
 **Target branch:** `main`  
 **Owners:** vge-agent-guard  
 **Related:**
@@ -19,6 +20,7 @@
 **Phase 1** (this document) delivers a **full native sidecar** written in TypeScript/Node.js. The sidecar:
 - **Replaces Phase 0 bash hook** — handles `UserPromptSubmit` and `PostToolUse` hooks, logs to VGE
 - **Tool gating** — intercepts `PreToolUse` hook, allows/blocks tool execution based on L1 + session state
+- **Tool output analysis** — configurable per-tool: sends tool output to VGE `/v1/guard/analyze` with `source: 'tool_output'` (not all tools, only explicitly classified external-content tools)
 - **Session state tracking** — detects prompt injections evolving across multiple turns (clean → caution → tainted)
 - **L1 heuristics locally** — fast pattern matching (<50ms) without waiting for VGE
 - **Configuration UI** — `vge-cc-guard config` TUI for easy setup
@@ -43,6 +45,8 @@ Phase 1 consolidates Phase 0 and adds tool gating + session awareness.
 | **Documentation** | README.md, PRD_0.md, troubleshooting | ✅ Complete |
 | **Testing** | Smoke tests, DRY_RUN mode | ✅ Complete |
 
+> **Note:** Phase 0 used `/v1/guard/output` for tool output. Phase 1 corrects this to `/v1/guard/analyze` with `source: 'tool_output'` — see section 7.5.
+
 ### 2.2 Phase 0 Architecture
 
 ```
@@ -54,7 +58,7 @@ Claude Code session (any project)
     │
     └─ PostToolUse hook fires (bonus)
        └─ ~/.claude/vg-cc/user-prompt-submit.sh
-          └─ POST /v1/guard/output
+          └─ POST /v1/guard/output  ← Phase 1 replaces with /v1/guard/analyze
 
 VGE receives both events
     ├─ Detection branches (heuristics, semantic, llm-guard, pii)
@@ -72,6 +76,8 @@ VGE receives both events
 | **Configuration** | Environment variables only | vge-cc-guard TUI for settings |
 | **Operator Control** | None; static rules in VGE | Server pushes policies to sidecars |
 | **Performance** | 5s timeout per prompt (blocking) | Async processing, <300ms PreToolUse latency |
+| **Wrong endpoint** | PostToolUse → /v1/guard/output | PostToolUse → /v1/guard/analyze + source='tool_output' |
+| **Selective analysis** | All tool outputs sent to VGE | Per-tool `analyze_output` config flag |
 
 ---
 
@@ -81,13 +87,14 @@ VGE receives both events
 
 Phase 1 must:
 
-1. **Replace Phase 0 bash hook:** Handle `UserPromptSubmit` and `PostToolUse` hooks in sidecar, log to `/v1/guard/input` and `/v1/guard/output` (same format as original hook).
+1. **Replace Phase 0 bash hook:** Handle `UserPromptSubmit` and `PostToolUse` hooks in sidecar, log to `/v1/guard/input` and (where configured) `/v1/guard/analyze` with `source: 'tool_output'`.
 2. **Tool gating via PreToolUse:** Intercept tool execution, run L1 check + check session state, return ALLOW/BLOCK before tool executes.
-3. **Session state machine:** Track conversation state (clean → caution → tainted) based on detection signals. Boost risk scoring for risky prompts in tainted sessions.
-4. **Local L1 heuristics:** Run pattern matching locally. Fast path: <10ms decision for obvious attacks without network.
-5. **VGE fallback:** For borderline L1 cases, async POST to VGE for semantic/llm-guard analysis (non-blocking).
-6. **Configuration UI:** `vge-cc-guard config` TUI lets users enable/disable features, set thresholds, choose which tools are gatable.
-7. **Graceful degradation:** If VGE unreachable, sidecar falls back to L1-only decisions (no blocking of Claude Code).
+3. **Selective tool output analysis:** Per-tool `analyze_output` flag in config. Only tools explicitly classified as external-content sources send output to VGE. See section 7.5.
+4. **Session state machine:** Track conversation state (clean → caution → tainted) based on detection signals. Boost risk scoring for risky prompts in tainted sessions.
+5. **Local L1 heuristics:** Run pattern matching locally. Fast path: <10ms decision for obvious attacks without network.
+6. **VGE fallback:** For borderline L1 cases, async POST to VGE for semantic/llm-guard analysis (non-blocking).
+7. **Configuration UI:** `vge-cc-guard config` TUI lets users enable/disable features, set thresholds, choose which tools are gatable and which send output to VGE.
+8. **Graceful degradation:** If VGE unreachable, sidecar falls back to L1-only decisions (no blocking of Claude Code). On VGE analysis error: log and continue — never block on analysis failure.
 
 ### 3.2 Non-Goals
 
@@ -99,6 +106,7 @@ Phase 1 explicitly does **not**:
 4. Support custom rule scripting — policies are JSON templates from server.
 5. Handle multi-session correlation — that's Phase 2 (session replay).
 6. Implement OTel/observability — that's Phase 2.
+7. Log raw tool output payloads — `analyze_output` means "send to VGE for analysis", not "persist raw content". Consistent with VGE's own `storePromptContent` / `agentContextLoggingEnabled` separation.
 
 ---
 
@@ -116,11 +124,11 @@ Claude Code session
     ├─ UserPromptSubmit
     │  └─ POST to sidecar (local)
     │     ├─ Run L1 heuristics (fast path)
-    │     ├─ If suspicious: async POST /v1/guard/input (VGE)
+    │     ├─ Async POST /v1/guard/input (VGE)
     │     └─ Update session state
     │
     ├─ PreToolUse
-    │  └─ POST to sidecar (local) — **CRITICAL PATH**
+    │  └─ POST to sidecar (local) — CRITICAL PATH
     │     ├─ Fast decision (<10ms typical):
     │     │  ├─ Check cached L1 result for current prompt
     │     │  ├─ Check session state (tainted? boost threshold)
@@ -135,8 +143,13 @@ Claude Code session
     │     └─ If ALLOW: log, return {"decision": "ALLOW"}
     │
     ├─ PostToolUse
-    │  └─ Async analysis (non-blocking)
-    │     ├─ Run L1 heuristics on tool output
+    │  └─ Async processing (non-blocking)
+    │     ├─ Check tool config: analyze_output?
+    │     │  ├─ true  → truncate to 64KB → POST /v1/guard/analyze
+    │     │  │          source: 'tool_output'
+    │     │  │          on error: log_and_continue (never block)
+    │     │  └─ false → skip VGE, log decision locally only
+    │     ├─ Run L1 heuristics on tool output (always, regardless of analyze_output)
     │     ├─ If injection detected: update session state → TAINTED
     │     └─ Log for audit
     │
@@ -147,14 +160,14 @@ Claude Code session
 ### 4.2 Sidecar Internal Architecture
 
 ```
-vge-cc-guard sidecar (single process, TypeScript + Node.js or Rust)
+vge-cc-guard sidecar (single process, TypeScript + Node.js)
     │
     ├─ HTTP listener (localhost:9090, Unix socket)
     │  ├─ /health — readiness probe
     │  ├─ /v1/hooks/presession — SessionStart → init state
     │  ├─ /v1/hooks/userprompt — UserPromptSubmit → L1 + VGE
-    │  ├─ /v1/hooks/pretool — PreToolUse → **GATING DECISION**
-    │  ├─ /v1/hooks/posttool — PostToolUse → audit
+    │  ├─ /v1/hooks/pretool — PreToolUse → GATING DECISION
+    │  ├─ /v1/hooks/posttool — PostToolUse → selective analysis + audit
     │  └─ /v1/hooks/sessionend — SessionEnd → cleanup
     │
     ├─ L1 Engine
@@ -168,13 +181,21 @@ vge-cc-guard sidecar (single process, TypeScript + Node.js or Rust)
     │  ├─ Per-session thresholds (from config)
     │  └─ Transitions: clean →(suspicious prompt) caution →(injection detected) tainted
     │
+    ├─ Tool Policy Engine
+    │  ├─ Per-tool config: { gate, analyze_output }
+    │  ├─ Default classifications (see section 7.5)
+    │  └─ Wildcard fallback: "*" entry
+    │
     ├─ VGE Client
-    │  ├─ Async POST /v1/guard/input for borderline prompts
+    │  ├─ Async POST /v1/guard/input for user prompts
+    │  ├─ Async POST /v1/guard/analyze (source='tool_output') for tool outputs
+    │  ├─ Payload truncation: text ≤ 100k chars, tool result ≤ 64KB
     │  ├─ Cached L2 results (5 min TTL)
-    │  └─ Exponential backoff on failure
+    │  └─ Exponential backoff on failure (3 retries, max 5s total)
     │
     └─ Audit Logger
        ├─ Local JSON log (decisions, timestamps, risk scores)
+       ├─ Does NOT log raw tool output content
        └─ Async flush to VGE /v1/audit/events
 ```
 
@@ -195,36 +216,59 @@ vge-agent-guard/
 │   │   ├── http-server.ts                        # Listener for hook endpoints
 │   │   ├── l1-engine.ts                          # Pattern matching, heuristics
 │   │   ├── session-state.ts                      # State machine
+│   │   ├── tool-policy.ts                        # Per-tool gate + analyze_output resolution
 │   │   ├── vge-client.ts                         # VGE communication
-│   │   └── audit-logger.ts                       # Decision logging
+│   │   └── audit-logger.ts                       # Decision logging (no raw content)
 │   │
 │   └── tui/
 │       └── config-ui.ts                          # `vge-cc-guard config` TUI
 │
 ├── config/
-│   └── default-policies.json                     # Default L1 rules (bundled)
+│   └── default-policies.json                     # Default tool classifications + L1 rules
 │
 ├── tests/
 │   ├── l1-engine.test.ts
 │   ├── session-state.test.ts
+│   ├── tool-policy.test.ts
 │   └── integration/
 │       └── claude-code-integration.test.ts
 │
 ├── docs/
-│   ├── INSTALLATION.md                           # How to install Phase 1
-│   └── ARCHITECTURE.md                           # Deep dive on state machine
+│   ├── INSTALLATION.md
+│   └── ARCHITECTURE.md
 │
 └── .github/workflows/
-    └── npm-publish.yml                           # Build + publish to npm
+    └── npm-publish.yml
 ```
 
-**Installation for users:**
-```bash
-npm install -g vge-cc-guard
-vge-cc-guard install      # Installs hooks in ~/.claude/settings.json
-vge-cc-guard config       # TUI to configure tool policies
-vge-cc-guard daemon       # Starts the sidecar (runs in background)
+### 5.1 Per-Tool Config Schema
+
+Each tool entry in `~/.vge-cc-guard/config.json`:
+
+```json
+{
+  "tools": {
+    "WebSearch":  { "gate": "allow", "analyze_output": true  },
+    "WebFetch":   { "gate": "allow", "analyze_output": true  },
+    "Bash":       { "gate": "block", "analyze_output": false },
+    "Write":      { "gate": "block", "analyze_output": false },
+    "Edit":       { "gate": "block", "analyze_output": false },
+    "Read":       { "gate": "allow", "analyze_output": false },
+    "Glob":       { "gate": "allow", "analyze_output": false },
+    "Grep":       { "gate": "allow", "analyze_output": false },
+    "*":          { "gate": "ask",   "analyze_output": false }
+  }
+}
 ```
+
+**Field semantics:**
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| `gate` | `"allow"` \| `"block"` \| `"ask"` | PreToolUse decision |
+| `analyze_output` | `true` \| `false` | Send PostToolUse output to `/v1/guard/analyze` |
+
+**`analyze_output` is not `log_output`** — it means "submit to VGE detection pipeline". Raw content is never persisted by the sidecar, consistent with VGE's own `storePromptContent` / `agentContextLoggingEnabled` separation.
 
 ---
 
@@ -232,38 +276,38 @@ vge-cc-guard daemon       # Starts the sidecar (runs in background)
 
 ### 6.1 Phase 1a — MVP: Full Sidecar with Tool Gating (3-4 weeks)
 
-**Minimal viable product: Phase 0 logging + PreToolUse gating.**
+**Minimal viable product: Phase 0 logging + PreToolUse gating + selective PostToolUse analysis.**
 
 - [ ] HTTP sidecar (Node.js + Express)
-- [ ] UserPromptSubmit hook handler → POST `/v1/guard/input` (Phase 0 func)
-- [ ] PostToolUse hook handler → POST `/v1/guard/output` (Phase 0 func)
+- [ ] UserPromptSubmit hook handler → POST `/v1/guard/input`
+- [ ] PostToolUse hook handler → POST `/v1/guard/analyze` (`source: 'tool_output'`) only when `analyze_output: true`
+- [ ] Payload truncation before VGE calls (text ≤ 100k chars, tool result ≤ 64KB)
+- [ ] `on_analysis_error: continue` — VGE failure never blocks tool execution
 - [ ] L1 engine: 50 regex patterns (SQL injection, command injection, etc.)
 - [ ] Session state machine: clean → caution → tainted
 - [ ] PreToolUse hook handler → return ALLOW/BLOCK (gating decision)
   - Check L1 + session state
   - Boost threshold if session tainted
-- [ ] Config: environment variables (no TUI yet)
-- [ ] Tests: unit tests for L1, session state, integration test with Claude Code
+- [ ] Per-tool config with `gate` + `analyze_output` (object format)
+- [ ] Config: JSON file at `~/.vge-cc-guard/config.json` (no TUI yet)
+- [ ] Tests: unit tests for L1, session state, tool-policy, integration test with Claude Code
 - [ ] Acceptance: PreToolUse latency p99 < 50ms, UserPromptSubmit async non-blocking, no false positives
 
 ### 6.2 Phase 1b — Resilience & Observability (1-2 weeks)
 
 - [ ] Error handling: VGE unreachable → fallback to L1-only decisions (no BLOCK timeout)
 - [ ] Caching: 5-min TTL for VGE L2 results (for borderline L1 cases)
-- [ ] Local debug logging: structured JSON logs (phase, decision, latency, scores)
-  - Log rotation: max 50MB per file, keep 5 last files
+- [ ] Local debug logging: structured JSON logs (phase, decision, latency, scores) — no raw content
+  - Log rotation: max 50MB per file, keep 5 last files, auto-delete logs older than 7 days
 - [ ] Connection retry: exponential backoff for VGE POST (3 retries, max 5s total)
-- [ ] Tests: error path testing, cache hit/miss scenarios
+- [ ] Tests: error path testing, cache hit/miss, truncation boundary scenarios
 - [ ] Acceptance: sidecar survives 10-minute VGE outage without crashing, all decisions logged locally
 
 ### 6.3 Phase 1c — Polish (1-2 weeks)
 
-- [ ] TUI: `vge-cc-guard config` for settings
-- [ ] Error handling: graceful degradation (L1 only if VGE down)
-- [ ] Local debug logging: structured logs for troubleshooting (JSON to file)
-  - Log rotation: max 50MB per file, keep 5 last files, auto-delete old logs
-- [ ] Installer: `vge-cc-guard install` sets up ~/.claude/settings.json
-- [ ] Acceptance: e2e test with real Claude Code session
+- [ ] TUI: `vge-cc-guard config` for settings including per-tool `analyze_output` toggle
+- [ ] Installer: `vge-cc-guard install` sets up `~/.claude/settings.json`
+- [ ] Acceptance: e2e test with real Claude Code session, including WebFetch → VGE analyze flow
 
 ---
 
@@ -320,8 +364,42 @@ vge-cc-guard daemon       # Starts the sidecar (runs in background)
 ### 7.4 Tool Blocklist
 
 - **Configurable:** operators define which tools are "gatable" (e.g., Bash, code-execution).
-- **Default:** only Bash and similar high-risk tools. Read, Write are exempt.
-- **Override:** per-project in `~/.claude/settings.json` (e.g., "allow all tools").
+- **Default:** Bash, Write, Edit blocked. Read, Glob, Grep allowed.
+- **Override:** per-project in `~/.claude/settings.json` or `<project>/.claude/.env`.
+
+### 7.5 Tool Output Analysis — Endpoint and Defaults ✅ DECIDED
+
+**Endpoint:** `POST /v1/guard/analyze` with `source: 'tool_output'`.
+
+**Why not `/v1/guard/output`:** That endpoint is semantically for `model_output` and hardcodes `source: 'model_output'` internally (VGE `guard-output.ts:27`). Using it for tool results would set the wrong `source` field. VGE explicitly reserves `source` for future source-aware policy routing (`docs/api/endpoints.md:258`, `packages/shared/src/schemas/index.ts:143`), so incorrect mapping now creates technical debt.
+
+**Default `analyze_output` by category:**
+
+| Category | Tools | `analyze_output` default | Rationale |
+|----------|-------|--------------------------|-----------|
+| External/network | WebSearch, WebFetch, mcp_browser | `true` | Primary vector for prompt injection via external content |
+| Filesystem read | Read, Glob, Grep | `false` | **Conscious gap** — attacker-controlled files (cloned repos, downloaded artifacts, PR content) can also carry injections. Excluded from MVP defaults for noise reduction, not because they're safe. |
+| Code execution | Bash, Python | `false` | **Conscious gap** — shell output can carry external content. Excluded from defaults; operators with stricter requirements should enable. |
+| Filesystem write | Write, Edit | `false` | Output is content Claude wrote, not external input |
+| Unknown / custom MCP | `*` | `false` | Unknown MCP may be a local DB, k8s, or secret manager. Enabling by default risks sending sensitive data to VGE and generating noise. Classify explicitly. |
+
+**`analyze_output: false` is a documented gap, not a security guarantee.** Operators who need full coverage should enable it per tool. The default is a signal/noise tradeoff for MVP.
+
+### 7.6 VGE Payload Limits and Fail-Mode
+
+VGE enforces the following limits (from `packages/shared/src/schemas/index.ts:86`):
+
+| Field | Limit |
+|-------|-------|
+| `text` | 100,000 characters |
+| `tool.result.content` | 64 KB |
+| `conversation` | 256 KB total |
+
+**Sidecar behavior:**
+- Truncate tool output to 64KB before sending to `/v1/guard/analyze`. Log truncation event.
+- If truncated content cannot represent injection signal meaningfully (e.g., binary data), send hash-only placeholder and skip content field.
+- On VGE analysis error (timeout, 4xx, 5xx): `log_and_continue` — the tool that already ran is not retroactively blocked, and the next tool is not blocked because of an analysis failure. Session state is not updated on error.
+- This fail-mode is intentional: analysis errors must not degrade Claude Code usability.
 
 ---
 
@@ -334,8 +412,12 @@ vge-cc-guard daemon       # Starts the sidecar (runs in background)
 5. **Tool gating:** BLOCK decision is honored (no tool execution); ALLOW lets tool run.
 6. **Audit logging:** all decisions logged locally + flushed to VGE within 10 seconds.
 7. **Graceful degradation:** if VGE unreachable, sidecar falls back to L1 only (does not crash).
-8. **Installer:** `vge-cc-guard install` successfully sets up both Phase 0 (hook) and Phase 1 (sidecar) in one command.
-9. **Documentation:** installation, configuration, troubleshooting all documented.
+8. **VGE endpoint correctness:** PostToolUse analysis uses `/v1/guard/analyze` with `source: 'tool_output'`. `/v1/guard/output` is never called for tool results.
+9. **Payload limits:** tool output truncated to 64KB before sending; truncation logged. No 400 errors from oversized payloads.
+10. **Analysis fail-mode:** VGE error on PostToolUse analysis → `log_and_continue`; no tool blocked, no crash.
+11. **Unknown tool default:** unrecognized tools have `gate: ask`, `analyze_output: false` unless explicitly configured.
+12. **Installer:** `vge-cc-guard install` successfully sets up both Phase 0 (hook) and Phase 1 (sidecar) in one command.
+13. **Documentation:** installation, configuration, troubleshooting all documented.
 
 ---
 
@@ -343,7 +425,7 @@ vge-cc-guard daemon       # Starts the sidecar (runs in background)
 
 | Milestone | Duration | Deliverable |
 |-----------|----------|-------------|
-| **Phase 1a (MVP)** | 3–4 weeks | Phase 0 logging + PreToolUse gating + session state |
+| **Phase 1a (MVP)** | 3–4 weeks | Phase 0 logging + PreToolUse gating + session state + selective PostToolUse analysis |
 | **Phase 1b (Resilience)** | 1–2 weeks | Error handling, caching, log rotation, retry logic |
 | **Phase 1c (Polish)** | 1–2 weeks | TUI, installer, E2E test |
 | **Phase 1 release** | 5–8 weeks total | `v1.0.0` tag |
@@ -358,29 +440,33 @@ When Phase 1 ships:
 
 1. Run `vge-cc-guard install` (replaces Phase 0 hook)
 2. Configure via `vge-cc-guard config` TUI
-3. Tools are now gated; decisions logged
+3. Tools are now gated; decisions logged; external tool outputs analyzed in VGE
 
 **No breaking change:** Phase 0 hook continues to work indefinitely for users who don't upgrade.
 
 ### 10.2 For VGE
 
 No changes needed on VGE side. Phase 1 sidecar:
-- Still POSTs to `/v1/guard/input` and `/v1/guard/output` (same format as Phase 0)
-- Adds new `/v1/policies` endpoint for rule distribution
-- Adds optional `/v1/audit/events` for audit log ingestion
+- POSTs user prompts to `/v1/guard/input` (same as Phase 0)
+- POSTs tool outputs to `/v1/guard/analyze` with `source: 'tool_output'` (corrected from Phase 0's `/v1/guard/output`)
+- Adds new `/v1/policies` endpoint for rule distribution (future)
+- Adds optional `/v1/audit/events` for audit log ingestion (future)
 
 ---
 
 ## 11. Open Questions (Design TBD)
 
-1. **Tool allowlist vs. blocklist:** Should phase 1 default to "block all" or "allow all except Bash"?
-   - Current thinking: allowlist high-risk tools (Bash, Eval), exempt others.
-
-2. **Session state across Claude Code restarts:** Should state persist (risky) or reset on restart (safe)?
+1. **Session state across Claude Code restarts:** Should state persist (risky) or reset on restart (safe)?
    - Current thinking: reset on restart (SessionEnd hook cleans up).
 
-3. **VGE API key distribution:** Should sidecar use same key as Phase 0, or separate sidecar-only key?
+2. **VGE API key distribution:** Should sidecar use same key as Phase 0, or separate sidecar-only key?
    - Current thinking: share `~/.claude/.env` key; Phase 1 installer migrates Phase 0 credentials.
+
+3. **Truncation strategy for structured tool output:** WebFetch may return JSON/HTML; truncating at byte boundary may produce invalid JSON. Should sidecar attempt to preserve structure, or always truncate at character boundary and let VGE handle it?
+   - Current thinking: truncate at character boundary, add `"[truncated]"` suffix. VGE already handles partial content.
+
+4. **Per-project `analyze_output` override:** Should project-level config be able to add tools to `analyze_output: true` beyond the user-level defaults?
+   - Current thinking: yes, via `<project>/.claude/.env` or a project-level `vge-cc-guard.json`. Design in Phase 1b.
 
 ---
 
@@ -388,6 +474,10 @@ No changes needed on VGE side. Phase 1 sidecar:
 
 - [PRD_0](../PRD_0/PRD_0.md) — User Prompt Logger (Phase 0, complete)
 - [Concept doc](../../architecture/claude-code-agent-security-integration.md) — full system vision
-- [ADR-0001](../../adr/ADR-0001-project-scope-and-language.md) — language choice (pending)
-- VGE PRD_29 — detection pipelines
-- VGE architecture — /v1/guard/input, /v1/guard/output endpoints
+- [ADR-0001](../../adr/ADR-0001-project-scope-and-language.md) — language choice (TypeScript, decided)
+- VGE `guard-output.ts:27` — source: 'model_output' hardcoded, confirms wrong endpoint for tool results
+- VGE `docs/api/endpoints.md:258` — /v1/guard/analyze source field semantics
+- VGE `packages/shared/src/schemas/index.ts:86,143` — payload limits and source field schema
+- VGE `detection-pipeline.ts:260` — agentContextLoggingEnabled pattern (analyze vs. log separation)
+- VGE `decision-pipeline-helpers.ts:382` — storePromptContent pattern
+- VGE `decision-pipeline-helpers.test.ts:462` — raw snapshot protection tests
