@@ -2,6 +2,8 @@
 
 Date: 2026-04-18 (v2, post-audit)
 
+> **Document role.** This is the original concept document that established the architectural vision: where the control points are, what VGE provides, what Claude Code exposes, what the threat model is, and what the rollout shape looks like. The **locked Phase 1 design** lives in [PRD_1](../prd/PRD_1/PRD_1.md). Where this concept disagrees with PRD_1 (notably: L1 heuristics, four-action scopeDrift, the original Phase 0/1/2 rollout split, and the Approval-Fatigue cooldown), **PRD_1 is authoritative**. The concept is preserved for context.
+
 ## Executive Summary
 
 The primary control point for agent protection is not the user's prompt. It is the boundary where the agent reads untrusted external content, executes tools, or changes its own permissions. For Claude Code specifically, Anthropic already exposes that boundary through hooks, managed settings, and OTel telemetry.
@@ -10,7 +12,7 @@ This document describes a realistic, deployable integration that combines:
 
 1. Claude Code managed settings and permissions as the hard baseline.
 2. Claude Code hooks (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PermissionDenied`, `ConfigChange`, `SessionEnd`) as runtime decision points.
-3. A local `vge-agent-guard` sidecar as the policy engine, managed through a terminal UI (TUI).
+3. A local `vge-cc-guard` sidecar as the policy engine, managed through a terminal UI (TUI).
 4. VGE as the detection and audit plane behind the sidecar.
 
 The product is positioned against one real direct competitor (Lasso Security `claude-hooks`, advisory-only). The differentiators are: BLOCK by default, `scopeDrift` for intent control, a full audit path, and a first-class TUI for configuration.
@@ -136,16 +138,19 @@ Verified against `https://code.claude.com/docs/en/`:
       │   PermissionDenied, ConfigChange, SessionEnd)
       ▼
   ┌────────────────────────────────┐
-  │   vge-agent-guard (local)      │
+  │   vge-cc-guard (local)         │
   │                                │
-  │   L1: fast local heuristics    │  < 10 ms
-  │   L2: VGE /v1/guard/analyze    │  when L1 uncertain
+  │   shim ─► daemon over Unix sock │
+  │   (PRD_1 §7.13)                │
+  │                                │
+  │   PreToolUse: local routing    │  < 10 ms
+  │   PostToolUse: VGE analyze     │  off critical path
   │                                │
   │   session state: clean /       │
   │     caution / tainted          │
   │                                │
   │   TUI for configuration        │
-  │   (vge-cc-guard command)          │
+  │   (vge-cc-guard command)        │
   └────────────────────────────────┘
       │
       │  REST + NATS
@@ -166,15 +171,21 @@ existing API.
 
 ## Hook-to-Sidecar Mapping
 
-| Hook | Purpose | Decision authority |
-|---|---|---|
-| `UserPromptSubmit` | Log initial intent. Optional scope extraction. Block obviously prohibited prompts. | Advisory |
-| `PreToolUse` | Primary gate. Allow / deny / ask based on tool name, arguments, session state. | **Enforcement** |
-| `PermissionRequest` | Convert weak user prompts into session-scoped allowances (see Approval UX). | Enforcement |
-| `PostToolUse` | Scan tool output as `source = tool_output`. On risk, inject `additionalContext` warning and tighten session state. | Advisory only (tool already ran) |
-| `PermissionDenied` | Risk signal; recorded in audit trail. | Signal only |
-| `ConfigChange` | Block local weakening of hooks, permissions, or skills during an active session. | Enforcement |
-| `SessionEnd` | Flush audit buffer, persist session summary. | N/A |
+> Phase 1 wires only the bolded subset (`UserPromptSubmit`, `PreToolUse`,
+> `PostToolUse`, `SessionStart`, `SessionEnd`). `PermissionRequest`,
+> `PermissionDenied`, and `ConfigChange` are deferred to Phase 2. See
+> [PRD_1 §4.4](../prd/PRD_1/PRD_1.md).
+
+| Hook | Purpose | Decision authority | Phase 1 |
+|---|---|---|---|
+| **`UserPromptSubmit`** | Log initial intent; parse escalation replies (`once`/`session`/`block`/`quarantine`) when a pending escalation exists. | Advisory + reply-parser | yes |
+| **`PreToolUse`** | Primary gate. `permissionDecision = allow / deny / ask` based on tool config, session state, allowlist, credential path deny list, pending escalations. | **Enforcement** | yes |
+| `PermissionRequest` | Convert weak user prompts into session-scoped allowances. | Enforcement | Phase 2 |
+| **`PostToolUse`** | Scan tool output as `source = tool_output` (when configured). Confidence Router routes outcome (HARD_TAINT / SOFT_TAINT / ESCALATE / ALLOW). | Advisory only (tool already ran) | yes |
+| `PermissionDenied` | Risk signal; recorded in audit trail. | Signal only | Phase 2 |
+| `ConfigChange` | Block local weakening of hooks, permissions, or skills during an active session. | Enforcement | Phase 2 |
+| **`SessionStart`** | Initialize per-session state. | N/A | yes |
+| **`SessionEnd`** | Flush audit buffer, allowlist, pending queue. | N/A | yes |
 
 ## Session State Reduction (from VGE output)
 
@@ -194,30 +205,15 @@ Action policy per state:
 | `caution` | allow read-only | ask |
 | `tainted` | narrow read-only only | deny outbound net, deny secret reads, deny repo writes, deny broad shell |
 
-## Latency Budget (L1 / L2)
+## Latency Budget (superseded — see PRD_1 §7.13)
 
-PreToolUse is on the critical path of every tool call. A pure
-sidecar → VGE `/v1/guard/analyze` round trip would be too slow for
-interactive use. The sidecar uses a two-tier decision path:
-
-**L1 — local heuristic (budget: < 10 ms)**
-- Tool name allow/deny lists.
-- URL domain allow/deny.
-- File path patterns (secrets, `.env`, credentials, SSH keys).
-- Bash command prefix patterns (`curl`, `wget`, `nc`, `ssh`, `scp`).
-- Current session state (`clean / caution / tainted`).
-
-L1 alone resolves the majority of `PreToolUse` calls. When L1 is decisive,
-the hook returns without calling VGE.
-
-**L2 — VGE `/v1/guard/analyze` (budget: ≤ 300 ms)**
-- Triggered when L1 returns "uncertain" or when content needs text analysis.
-- Used predominantly for `PostToolUse` (not time-critical for the user),
-  `UserPromptSubmit`, and ambiguous `PreToolUse` cases.
-- Result is cached per-session for the same content hash.
-
-This keeps the 99th-percentile `PreToolUse` latency well under 50 ms in
-practice.
+> The original two-tier L1/L2 design is replaced in PRD_1 §7.2 with a single
+> rule: the sidecar runs **no local content detection**. PreToolUse decisions
+> use only `(tool_name → gate)` lookup, session state, allowlist, and the
+> hard-coded credential path deny list. VGE is the only content detector
+> and is reached only on PostToolUse and UserPromptSubmit, both off the
+> critical path. The 50 ms p99 budget remains; with no detection on
+> PreToolUse it is comfortably met (target: < 10 ms typical).
 
 ## Fail-Mode Policy
 
@@ -225,7 +221,7 @@ Every hook specifies behaviour when its dependency is unavailable.
 
 | Hook | Sidecar down | VGE down | Timeout |
 |---|---|---|---|
-| `PreToolUse` | fail-closed (deny with clear message) | L1 only, escalate to `ask` on ambiguity | fail-closed |
+| `PreToolUse` | fail-closed (shim exits 2, deny with clear message) | unaffected — PreToolUse never depends on VGE (PRD_1 §7.2) | fail-closed |
 | `PostToolUse` | fail-open (log only) | fail-open | fail-open |
 | `UserPromptSubmit` | fail-open | fail-open | fail-open |
 | `ConfigChange` | fail-closed (block change) | fail-closed | fail-closed |
@@ -237,21 +233,22 @@ UX pain.
 Fail-open on `PostToolUse` is safe because the tool has already executed —
 the worst case is delayed detection, not a missed block.
 
-## Approval Fatigue Mitigation
+## Approval Fatigue Mitigation (revised — see PRD_1 §7.10)
 
-`ask` returned for every tool call is a UX disaster and will kill adoption.
-The sidecar provides three mitigations:
+PRD_1 narrows the original three-mechanism design down to one explicit,
+auditable channel:
 
-1. **Session-scoped allowances.** An `ask → allow` for `Read` of a
-   directory grants `Read` on children for the rest of the session.
-   Scoped to tool + argument pattern.
-2. **Batch approval.** When the agent plans `N` similar actions (e.g. ten
-   file reads), the sidecar aggregates them into one prompt.
-3. **Cooldown.** After an `ask`, repeats of the same action within `T`
-   seconds auto-approve silently.
-
-All three are configurable through the TUI. Defaults:
-session-scope ON, batch ON, cooldown 30 s.
+- **Per-resource session allowlist.** When the user resolves an
+  ask-dialog with `session`, the exact `(tool_name, resource_id)`
+  is added to a session-scoped allowlist. Future calls on that
+  resource skip the ask-dialog but **still flow through VGE
+  analysis** for telemetry (soft allowlist).
+- **Cap on ask-dialogs per session** (default: 3). Beyond the cap
+  further `ESCALATE` outcomes auto-convert to `HARD_TAINT` so the
+  user is not bombarded.
+- **No silent cooldown, no batch-approval**: removed because they
+  were imprecise and bypassed the audit trail. Different resources
+  always get separate decisions even if same tool.
 
 ## Sidecar Configuration: Terminal UI
 
@@ -262,7 +259,7 @@ command, split-pane, keyboard-driven, live-updating.
 Command: `vge-cc-guard`
 
 ```
-┌─ vge-agent-guard ── session: local ── status: clean ─────────────────┐
+┌─ vge-cc-guard ── session: local ── status: clean ────────────────────┐
 │                                                                      │
 │  [1] Rules       [2] Events     [3] Approvals    [4] Audit           │
 │  [5] Policy      [6] Session    [7] Stats        [q] Quit            │
@@ -297,9 +294,11 @@ Views:
 - **Stats** — decision distribution, L1/L2 split, p50/p99 latency, cache
   hit rate, VGE availability.
 
-Configuration file: `~/.config/vge-cc-guard/config.toml`. Simple, commentable,
-and text-editor-friendly. The TUI is a live face onto the same file — edits
-made in either place are reflected live in the other.
+Configuration file: `~/.vge-cc-guard/config.json` (PRD_1 §5.1). The TUI is
+a live face onto the same file — edits made in either place are reflected
+live in the other. JSON was chosen over the originally proposed TOML to
+match the rest of the toolchain (Zod validation, npm/Node ecosystem) and
+because the configurator is the primary editing surface anyway.
 
 No HTTP admin API. No browser-based dashboard. The TUI plus the config file
 are the entire configuration surface.
@@ -312,20 +311,26 @@ in read-only mode.
 
 Two supported paths.
 
-**Individual developer**
+**Individual developer** (PRD_1 §6 / §7.13)
 
 ```
-$ brew install vge-agent-guard          # or: pnpm dlx @vigilguard/agent-guard init
-$ vge-cc-guard init                        # writes managed settings + hook config
-$ vge-cc-guard                             # open TUI
+$ npm install -g vge-cc-guard
+$ vge-cc-guard install                     # interactive: merge vs dry-run, user-wide vs project
+$ vge-cc-guard config                      # interactive TUI: API keys + per-tool policy
 ```
 
-`vge-cc-guard init` writes:
+`vge-cc-guard install` writes:
 
-- `~/.claude/settings.json` — hooks registered, permission rules set,
-  `allowManagedHooksOnly = true`.
-- `~/.config/vge-cc-guard/config.toml` — sidecar config.
-- Starts the sidecar as a background service (launchd / systemd).
+- `~/.claude/settings.json` — hooks registered as command-style entries
+  pointing at `vge-cc-guard hook <event>` (the shim). Existing user hooks
+  are preserved via merge; the original file is backed up to
+  `~/.vge-cc-guard/.pre-install-settings.backup` for `vge-cc-guard uninstall`.
+- `~/.vge-cc-guard/config.json` — sidecar configuration (JSON, not TOML;
+  see PRD_1 §5.1).
+
+The daemon is **not** registered with launchd/systemd. It is started
+lazily by the shim on the first hook invocation and stays alive for the
+session. See PRD_1 §7.13.
 
 **Organization rollout**
 
@@ -352,46 +357,28 @@ block. VGE differentiates on four axes:
 3. **Full audit path** via existing VGE logging worker + ClickHouse.
 4. **TUI** — one command, no browser, no web dashboard, no admin API.
 
-## Rollout Plan
+## Rollout Plan (superseded — see PRD_1 §9 and §13)
 
-### Phase 0 — VGE wire-up (weeks 1–2)
+> The original Phase 0 / Phase 1 / Phase 2 split has been replaced by the
+> actual Phase 0 (a bash hook delivered 2026-04-20) plus the Phase 1
+> sub-phases 1a / 1b / 1c defined in [PRD_1 §9](../prd/PRD_1/PRD_1.md).
+> The summary below is kept for historical context.
 
-1. Call `logDetectionRequest` from the guard controllers (one line per
-   controller, infrastructure already exists).
-2. Consume `source` in the arbiter: stricter thresholds and scope-drift
-   handling when `source = tool_output`.
-3. Add agent metadata passthrough: accept `session_id`, `prompt_id`,
-   `tool_name`, `tool_use_id`, `hook_event`, `agent_type`,
-   `destination_domain` inside the existing `metadata` object. Persist to
-   the flex JSON columns in ClickHouse. No schema migration.
-4. Correct the comment in `types/scope-drift.ts` about 4-action support.
-
-No Claude Code code is touched in this phase.
-
-### Phase 1 — sidecar MVP (weeks 3–6)
-
-1. `vge-agent-guard` local daemon with L1/L2 decision path.
-2. `vge-cc-guard` TUI: Rules, Events, Approvals, Audit, Policy, Session, Stats.
-3. Managed-settings template that locks hooks, permissions, and
-   `disableBypassPermissionsMode`.
-4. `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `PermissionDenied`,
-   `ConfigChange`, `SessionEnd` wired to the sidecar.
-5. Approval-fatigue mitigations enabled by default.
-6. Installer (`vge-cc-guard init`) for macOS and Linux.
-
-### Phase 2 — production polish (weeks 7–10)
-
-1. Server-managed policy rollout, read-only TUI mode.
-2. OTel → VGE payload mapping for investigation UI.
-3. Session replay view in the TUI.
-4. Organisation-level audit rollups in VGE dashboards.
-
-### Phase 3 — expansion (future, not committed here)
-
-- Other agents (Cursor, Copilot) — same L1/L2 model if they expose hooks.
-- MCP integration — **out of scope now**, likely through a partnership or
-  external vendor.
-- Remote / cloud-hosted agents.
+- **Phase 0** (delivered): bash `UserPromptSubmit` hook posting to
+  `/v1/guard/input`, no enforcement.
+- **Phase 1a** (3–4 weeks): full TypeScript sidecar — shim + daemon,
+  PreToolUse gating with hard-coded credential path deny list,
+  PostToolUse analysis with Confidence Router, ask-dialog with
+  `once`/`session`/`block`/`quarantine`, soft per-resource allowlist,
+  TUI configurator (API keys / Tools / Security Baseline / View).
+- **Phase 1b** (1–2 weeks): error handling, retry/backoff to VGE,
+  session-state persistence, log rotation.
+- **Phase 1c** (2–3 weeks): live-monitoring TUI views (events / stats /
+  audit), `--project` install scope, e2e tests.
+- **Phase 2** (future): server-managed policy, OTel mapping, session
+  replay, `PermissionRequest`/`PermissionDenied`/`ConfigChange`
+  hook handling.
+- **Phase 3** (future): other agents, MCP integration.
 
 ## Anti-Patterns We Explicitly Avoid
 
@@ -435,6 +422,14 @@ plane that survives the session.
 - MUZZLE red-teaming framework: https://arxiv.org/abs/2602.09222
 
 ## Changelog
+
+**v3 (2026-04-26)** — clarification pass after PRD_1 design lock.
+- Added "Document role" banner pointing to PRD_1 as authoritative.
+- Marked Latency Budget (L1/L2) as superseded; sidecar is now VGE-only for content detection.
+- Replaced Approval Fatigue cooldown with the per-resource session allowlist + ask-dialog cap.
+- Updated Hook-to-Sidecar mapping with explicit Phase 1 / Phase 2 split.
+- Updated Installation block to match `npm install -g vge-cc-guard` + lazy-start daemon.
+- Replaced Rollout Plan with pointer to PRD_1 §9.
 
 **v2 (2026-04-18)**
 - MCP integration moved out of scope.

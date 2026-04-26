@@ -1,18 +1,20 @@
-# CLAUDE.md - vge-agent-guard
+# CLAUDE.md - vge-cc-guard
 
-Project guidance for Claude Code working with the vge-agent-guard repository.
+Project guidance for Claude Code working with the vge-cc-guard repository.
+
+> **Note on the repo name.** The directory is currently `vge-agent-guard` for historical reasons. The product, npm package, CLI binary, and repo are all being renamed to `vge-cc-guard` as the first execution step (see [PRD_1 §13 Execution Plan](docs/prd/PRD_1/PRD_1.md)). All new code, docs, and configs should use `vge-cc-guard`.
 
 ---
 
 ## Project Overview
 
-**vge-agent-guard** — security sidecar for Claude Code. Gates tool calls via hooks, scans tool outputs through VGE, gives developers a terminal UI to configure runtime policy.
+**vge-cc-guard** — security sidecar for Claude Code. Gates tool calls via hooks, scans tool outputs through VGE, gives developers a terminal UI to configure runtime policy.
 
 **Concept doc:** [docs/architecture/claude-code-agent-security-integration.md](docs/architecture/claude-code-agent-security-integration.md)
 
 **Mission in one sentence:** BLOCK-default runtime policy for Claude Code with scope-drift intent gating and a full audit path, positioned against Lasso Security's advisory-only `claude-hooks`.
 
-**Status:** Bootstrapped 2026-04-18. Language choice (Python / Rust / Go / TypeScript) not yet decided — see [docs/adr/ADR-0001-project-scope-and-language.md](docs/adr/ADR-0001-project-scope-and-language.md).
+**Status:** Phase 1 design locked 2026-04-26. TypeScript on Node.js, npm package `vge-cc-guard`, full sidecar with TUI configurator. See [PRD_1](docs/prd/PRD_1/PRD_1.md) and [ADR-0001](docs/adr/ADR-0001-project-scope-and-language.md).
 
 ---
 
@@ -193,9 +195,10 @@ All commits MUST follow format:
 **Scopes** (project-specific, will grow):
 
 - `sidecar` — sidecar daemon
-- `tui` — terminal UI
-- `hooks` — Claude Code hook integration
-- `policy` — policy engine (L1/L2, session state, approval fatigue)
+- `shim` — per-call hook shim (talks to daemon over Unix socket)
+- `tui` — terminal UI configurator
+- `hooks` — Claude Code hook integration / settings.json wiring
+- `policy` — tool policy, session state, allowlist, ask-dialog
 - `audit` — audit trail / logging
 - `vge` — VGE API client
 - `install` — installer and bootstrap
@@ -204,9 +207,9 @@ All commits MUST follow format:
 
 **Examples:**
 
-- `feat(sidecar): add L1 heuristic for Bash networking commands`
-- `fix(hooks): handle ConfigChange payload when matcher is null`
-- `security(policy): fail-closed on PreToolUse sidecar timeout`
+- `feat(policy): wire credential path deny list into Read/Edit/Write`
+- `fix(shim): exit 2 when daemon Unix socket is missing`
+- `security(policy): fail-closed on PreToolUse shim transport failure`
 
 ---
 
@@ -263,9 +266,9 @@ Provide complete fixes — don't stop at the first layer. Check for related fail
 
 | Type | Max Lines |
 |---|---|
-| Sidecar modules | 600 |
-| Hook scripts (Python/shell) | 300 |
-| TUI components | 500 |
+| Daemon modules (`src/daemon/*.ts`) | 600 |
+| Shim (`src/shim/*.ts`) | 300 — must stay tiny, this is the hot per-call path |
+| TUI components (`src/tui/*.ts`) | 500 |
 | General modules | 800 |
 
 If you're approaching the limit, split. Don't invent a "utils" module — find an intent-based name.
@@ -282,7 +285,7 @@ If you're approaching the limit, split. Don't invent a "utils" module — find a
 
 Coverage target: **80% minimum** for new code.
 
-Integration tests for: Claude Code hook integration (HTTP or stdin-JSON handshake), VGE API client (against live or mocked VGE), TUI key bindings.
+Integration tests for: shim ↔ daemon roundtrip over Unix socket, Claude Code hook payload handling end-to-end (golden fixtures from real CC sessions), VGE API client against a mocked `/v1/guard/input` and `/v1/guard/analyze`, TUI key bindings, install/uninstall flow against a sandbox `~/.claude/`.
 
 ---
 
@@ -294,7 +297,17 @@ Integration tests for: Claude Code hook integration (HTTP or stdin-JSON handshak
 
 **API keys:** never log keys, only labels. Never expose in responses.
 
-**Sidecar filesystem:** never read `.env`, `id_rsa`, `.ssh/`, `.aws/`, `.kube/`, `credentials*`, `secrets*` — this is our L1 deny list and it applies to the sidecar itself, not just to what it blocks for Claude.
+**Credential path protection (sidecar runtime).** The sidecar refuses tool calls that target the following paths regardless of per-tool config — this is a hard, hard-coded deny list, not pattern matching. It applies to `Read`, `Edit`, and `Write` (and any future tool that takes a path argument):
+
+- `~/.env`, `*/.env`, `*.env`
+- `~/.ssh/*` (any file under `.ssh/`)
+- `~/.aws/credentials`, `~/.aws/config`
+- `~/.kube/config`
+- `~/.config/gcloud/*`, `~/.gcp/*`
+- Files matching `id_rsa*`, `id_ed25519*`, `id_ecdsa*`
+- Files matching `*credentials*`, `*secrets*` at any depth
+
+The protection is a configurable toggle in the TUI (`policy.credential_protection`, default `true`). Disabling it requires a conscious flip in the configurator with a red warning. See [PRD_1 §7.11](docs/prd/PRD_1/PRD_1.md).
 
 **Hook inputs:** always parse as JSON, never `eval` or shell-interpolate user-controlled fields from Claude Code hook payloads.
 
@@ -327,39 +340,69 @@ Integration tests for: Claude Code hook integration (HTTP or stdin-JSON handshak
 ## Repository Structure
 
 ```
-vge-agent-guard/
+vge-cc-guard/                 # repo will be renamed from vge-agent-guard
 ├── CLAUDE.md                 # This file
-├── README.md                 # Minimal, points to docs/
+├── README.md                 # Install + quickstart, points to docs/
+├── CHANGELOG.md              # User-facing change log
 ├── LICENSE.md                # Copied from VGE (proprietary)
 ├── .gitignore
+├── package.json              # npm package manifest, "bin": { "vge-cc-guard": "dist/cli.js" }
+├── tsconfig.json
 │
 ├── docs/
+│   ├── CONFIG_DESIGN.md                                # Canonical TUI configurator spec
 │   ├── architecture/
-│   │   └── claude-code-agent-security-integration.md   # Concept doc (canonical)
+│   │   └── claude-code-agent-security-integration.md   # Concept doc
 │   ├── adr/
 │   │   ├── template.md
-│   │   └── ADR-0001-project-scope-and-language.md
+│   │   └── ADR-0001-project-scope-and-language.md      # Accepted: TypeScript
 │   └── prd/
-│       └── PRD_V1/           # First product requirements (TBD)
+│       └── PRD_1/
+│           └── PRD_1.md                                # Phase 1 spec (single source of truth)
 │
-├── src/                      # Sidecar + policy engine (language TBD)
+├── src/                      # TypeScript sources (PRD_1 §5)
+│   ├── cli.ts                # Entry point: install, config, daemon, hook, reset-session
+│   ├── shim/                 # Per-call hook shim (Unix socket client, fail-closed)
+│   ├── daemon/
+│   │   ├── http-server.ts
+│   │   ├── session-state.ts
+│   │   ├── tool-policy.ts
+│   │   ├── path-deny.ts      # Credential path protection (CLAUDE.md)
+│   │   ├── confidence-router.ts
+│   │   ├── ask-dialog.ts
+│   │   ├── allowlist.ts
+│   │   ├── vge-client.ts
+│   │   └── audit-logger.ts
+│   └── tui/
+│       └── config-ui.ts
+│
+├── config/
+│   └── default-tools.json    # Default tool policies shipped with the package
+│
 ├── tests/
+│   ├── unit/
+│   └── integration/
+│
 ├── examples/
-│   └── managed-settings.template.json   # Template for end users
-├── scripts/                  # Build/install/bootstrap
+│   ├── managed-settings.template.json
+│   └── prompt-logger-v0/     # Phase 0 bash hook (kept for legacy reference)
+│
+├── vg-cc/                    # Phase 0 hook (legacy, superseded by Phase 1 sidecar)
+│   └── hooks/
+│       └── user-prompt-submit.sh
 │
 └── .claude/                  # DEV tooling for working ON this repo
-    ├── hooks/                # Python/shell automation (from vigil-code scaffold)
-    ├── commands/             # Slash commands
-    ├── lib/                  # Memory loader/writer
-    ├── memory/               # Cross-session memory (gitignored contents)
+    ├── hooks/
+    ├── commands/
+    ├── lib/
+    ├── memory/
     ├── scripts/
-    └── settings.json         # Hook wiring
+    └── settings.json
 ```
 
 **Important distinction:**
 
-- `.claude/` is our **development environment** — productivity tooling for Claude Code sessions working ON vge-agent-guard.
+- `.claude/` is our **development environment** — productivity tooling for Claude Code sessions working ON vge-cc-guard.
 - `src/` + `examples/` + `scripts/` are the **product** itself — what end users install to protect their own Claude Code sessions.
 
 These two must not be confused. When in doubt, ask.
@@ -368,24 +411,17 @@ These two must not be confused. When in doubt, ask.
 
 ## Essential Commands
 
-**Not yet defined** — depends on language choice (ADR-0001 pending). Placeholders:
-
 ```bash
-# Python (if chosen)
-uv sync                    # or: pip install -e ".[dev]"
-uv run pytest              # tests
-uv run ruff check .        # lint
-uv run mypy src/           # typecheck
+pnpm install               # install dependencies
+pnpm build                 # tsc → dist/
+pnpm test                  # vitest
+pnpm lint                  # eslint
+pnpm typecheck             # tsc --noEmit
 
-# Rust (if chosen)
-cargo build
-cargo test
-cargo clippy
-
-# Go (if chosen)
-go build ./...
-go test ./...
-go vet ./...
+# Manual local install during development
+pnpm build && npm link
+vge-cc-guard install --dry-run   # preview hook changes
+vge-cc-guard daemon              # run daemon in foreground (DEBUG=vge-cc-guard:*)
 ```
 
 ---
@@ -396,7 +432,7 @@ go vet ./...
 
 1. Check existing ADRs in [docs/adr/](docs/adr/)
 2. If no relevant ADR exists, create one using `docs/adr/template.md`
-3. ADR required for: language choice, new dependencies, architectural changes, API contract changes, hook transport choice (HTTP vs stdin-JSON), TUI library choice, storage format for session state
+3. ADR required for: language choice, new dependencies, architectural changes, API contract changes, hook transport changes (current: shim → Unix socket → daemon), TUI library changes, storage format for session state, any addition of local content detection (current decision: VGE-only)
 
 **ADR naming:** `ADR-XXXX-short-description.md` (4-digit sequential number, starting at 0001)
 
@@ -424,5 +460,5 @@ go vet ./...
 
 ---
 
-**Last Updated:** 2026-04-18
-**Version:** 0.0.1 (bootstrap)
+**Last Updated:** 2026-04-26
+**Version:** 0.1.0 (Phase 1 design locked)
