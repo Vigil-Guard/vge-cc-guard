@@ -15,13 +15,33 @@ Commands:
 `.trim();
 
 switch (command) {
-  case 'install':
-  case 'uninstall':
+  case 'hook': {
+    const { main } = await import('./shim/index.js');
+    await main();
+    break;
+  }
+  case 'daemon': {
+    const { startDaemon } = await import('./daemon/http-server.js');
+    await startDaemon();
+    break;
+  }
+  case 'install': {
+    const { runInstall } = await import('./commands/install.js');
+    await runInstall(process.argv.slice(3));
+    break;
+  }
+  case 'uninstall': {
+    const { runUninstall } = await import('./commands/uninstall.js');
+    await runUninstall(process.argv.slice(3));
+    break;
+  }
+  case 'reset-session': {
+    const { runResetSession } = await import('./commands/reset-session.js');
+    await runResetSession();
+    break;
+  }
   case 'config':
-  case 'hook':
-  case 'daemon':
-  case 'reset-session':
-    console.log(`[stub] ${command} — not yet implemented`);
+    console.log('[stub] config — not yet implemented (Sprint 4)');
     break;
   default:
     console.log(usage);
