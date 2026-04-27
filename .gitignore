@@ -9,34 +9,16 @@ Thumbs.db
 *.swo
 *~
 
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.venv/
-venv/
-dist/
-build/
-*.egg
-
 # Node / pnpm
 node_modules/
-pnpm-lock.yaml
 .pnpm-store/
 *.tsbuildinfo
 
-# Rust
-target/
-Cargo.lock
-
-# Go
-/bin/
-*.test
-*.out
+# Build artifacts
+dist/
+coverage/
+*.log
+pnpm-debug.log*
 
 # Env / secrets
 .env
@@ -49,9 +31,3 @@ Cargo.lock
 .claude/memory/
 .claude/audit_logs/
 .claude/state/
-
-# Build artifacts
-*.log
-coverage/
-.coverage
-htmlcov/
