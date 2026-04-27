@@ -1,0 +1,39 @@
+{
+  "name": "vge-cc-guard",
+  "version": "0.1.0",
+  "description": "Security sidecar for Claude Code — gates tool calls, scans outputs via VGE",
+  "type": "module",
+  "engines": {
+    "node": ">=24.13.0 <25"
+  },
+  "bin": {
+    "vge-cc-guard": "./dist/cli.js"
+  },
+  "main": "./dist/cli.js",
+  "files": [
+    "dist/",
+    "config/"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "postbuild": "chmod +x dist/cli.js",
+    "build:watch": "tsc -p tsconfig.json --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "@typescript-eslint/eslint-plugin": "^8",
+    "@typescript-eslint/parser": "^8",
+    "eslint": "^9",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "@vitest/coverage-v8": "^2.1.8"
+  }
+}
