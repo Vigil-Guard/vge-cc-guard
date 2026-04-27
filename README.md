@@ -2,7 +2,7 @@
 
 BLOCK-default runtime policy for Claude Code, backed by VGE detection. Tool gating with credential path protection, per-resource session allowlist, full local audit trail, and a TUI configurator. Distributed as an npm package.
 
-> **Status:** Phase 1 design locked 2026-04-26. See [PRD_1](docs/prd/PRD_1/PRD_1.md) for the locked specification and the build sequence in §13.
+> **Status:** Sprints 1–3 complete (2026-04-27). Core sidecar is functional: shim, daemon, install/uninstall, lazy-start, session management, VGE integration, audit trail. Sprint 4 (TUI configurator + E2E tests) is next. See [PRD_1](docs/prd/PRD_1/PRD_1.md) for the locked specification.
 
 ---
 
@@ -23,7 +23,7 @@ What is intentionally **not** in the sidecar: local pattern matching, regex cont
 
 ## Prerequisites
 
-- Node.js 18+
+- Node.js 24+ (`>=24.13.0 <25`)
 - A reachable VGE instance (`vg_live_…` or `vg_test_…` API key)
 
 ---
@@ -144,7 +144,7 @@ vge-cc-guard install --apply --scope=user        # non-interactive, user-wide
 vge-cc-guard install --apply --scope=project     # current directory
 vge-cc-guard install --dry-run                   # print diff, don't write
 
-vge-cc-guard config        # TUI configurator
+vge-cc-guard config        # TUI configurator  [Sprint 4 — stub]
 vge-cc-guard daemon        # foreground daemon (development)
 vge-cc-guard reset-session # clear allowlist + pending + fatigue counter
 vge-cc-guard hook <event>  # hook subcommand invoked by Claude Code (don't call manually)
@@ -183,12 +183,14 @@ vge-cc-guard uninstall     # restore settings.json from snapshot, delete ~/.vge-
 
 ## Phase scope
 
-| Phase | Duration | Ships |
+| Sprint | Status | Ships |
 |---|---|---|
-| **1a** (MVP) | 3–4 weeks | Full sidecar feature set: shim+daemon, PreToolUse gating with credential path protection, Confidence Router, ask-dialog, soft allowlist, subagent inheritance, audit JSONL, install/uninstall, TUI configurator (4 screens). |
-| **1b** (Resilience) | 1–2 weeks | VGE retry/backoff, response cache, debug log rotation, session-state persistence. |
-| **1c** (Live monitoring + beta) | 2–3 weeks | TUI live views (Events / Pending / Audit / Stats), `--project` scope, end-to-end test suite, closed-beta `0.9.0-beta.x`. |
-| **`1.0.0`** | ~7–10 weeks | npm tagged release. |
+| **1** Foundation | ✅ Done | Shared types, config schema, IPC protocol, CLI scaffold |
+| **2** Daemon core | ✅ Done | HTTP server, all hook handlers, session state, tool policy, Confidence Router, ask-dialog, credential path protection, VGE client, audit JSONL |
+| **3** Shim + Install | ✅ Done | Shim (stdin → socket → stdout), lazy-start, install/uninstall/reset-session commands |
+| **4** TUI + E2E | 🔲 Next | `vge-cc-guard config` TUI (4 screens), end-to-end test suite |
+| **5** Resilience + Beta | 🔲 Planned | VGE retry/backoff, response cache, debug log rotation, closed-beta `0.9.0-beta.x` |
+| **`1.0.0`** | 🔲 Planned | npm tagged release |
 
 See [PRD_1 §13](docs/prd/PRD_1/PRD_1.md) for the step-by-step build sequence.
 
