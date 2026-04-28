@@ -27,9 +27,16 @@ function removeVgeHooks(settings: Record<string, unknown>): Record<string, unkno
   return { ...settings, hooks: filtered };
 }
 
+// PR-review S2: crash-safe atomic write — see install.ts for rationale.
 function writeAtomic(filePath: string, content: string): void {
   const tmp = filePath + '.tmp';
-  fs.writeFileSync(tmp, content, 'utf-8');
+  const fd = fs.openSync(tmp, 'w');
+  try {
+    fs.writeSync(fd, content);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, filePath);
 }
 
@@ -52,6 +59,10 @@ export async function runUninstall(args: string[]): Promise<void> {
   const backupPath = path.join(vgeDir, '.pre-install-settings.backup');
 
   if (fs.existsSync(backupPath)) {
+    // PR-review W2: warn that backup-restore overwrites any settings the user
+    // added after install. Sprint 4 TUI will offer hook-filter as the default.
+    console.log('NOTE: restoring pre-install settings.json — any settings you added');
+    console.log('      after the initial install will be replaced by the snapshot.');
     const backup = fs.readFileSync(backupPath, 'utf-8');
     const claudeDir = path.dirname(settingsPath);
     fs.mkdirSync(claudeDir, { recursive: true });

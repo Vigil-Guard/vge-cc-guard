@@ -12,9 +12,9 @@ export default defineConfig({
       reporter: ['text', 'html'],
       include: ['src/**'],
       exclude: [
-        'src/cli.ts',                   // stub dispatcher — integration tests in Sprint 3
         'src/shared/types.ts',          // pure TS interfaces, no executable statements
         'src/shared/ipc-protocol.ts',   // pure TS interfaces, no executable statements
+        'src/commands/daemon.ts',       // 4-line wrapper; covered by manual smoke test
       ],
       thresholds: {
         statements: 80,

@@ -54,9 +54,17 @@ function mergeHooks(settings: Record<string, unknown>): Record<string, unknown> 
   return { ...merged, hooks: newHooks };
 }
 
+// PR-review S2: crash-safe atomic write — fsync the file before rename so a power
+// loss between rename and the next OS flush can't leave a zero-length settings.json.
 function writeAtomic(filePath: string, content: string): void {
   const tmp = filePath + '.tmp';
-  fs.writeFileSync(tmp, content, 'utf-8');
+  const fd = fs.openSync(tmp, 'w');
+  try {
+    fs.writeSync(fd, content);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, filePath);
 }
 
@@ -126,4 +134,11 @@ export async function runInstall(args: string[]): Promise<void> {
 
   console.log(`vge-cc-guard hooks installed to ${settingsPath}`);
   console.log('Restart Claude Code to activate. Run `vge-cc-guard config` to set your API key.');
+  // PR-review W5: Write/Edit ship as gate=block by design (PRD §7.5).
+  // Until the TUI lands in Sprint 4, the only way to flip them to allow is
+  // to edit ~/.vge-cc-guard/config.json directly. Warn explicitly.
+  console.log('');
+  console.log('NOTE: Write and Edit are gated as `block` by default for safety.');
+  console.log('      Edit ~/.vge-cc-guard/config.json (tools.Write.gate / tools.Edit.gate)');
+  console.log('      to set them to `allow` per project. TUI configurator ships in Sprint 4.');
 }
