@@ -1,3 +1,4 @@
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
@@ -205,9 +206,12 @@ async function handlePostTool(req: Request, res: Response): Promise<void> {
   }
 
   let textToAnalyze = payload.tool_response ?? '';
-  const rawBuf = Buffer.from(textToAnalyze.slice(0, 8));
-  if (isBinaryBuffer(rawBuf)) {
-    textToAnalyze = `[binary content, sha256=${Buffer.from(payload.tool_response).toString('hex').slice(0, 64)}, len=${payload.tool_response.length}]`;
+  // PR-review C4: convert to Buffer first so the magic-byte check operates on bytes,
+  // not UTF-8 chars. Compute a real SHA-256 (was: hex-prefix mislabelled as sha256).
+  const fullBuf = Buffer.from(textToAnalyze);
+  if (isBinaryBuffer(fullBuf.subarray(0, 8))) {
+    const sha = crypto.createHash('sha256').update(fullBuf).digest('hex');
+    textToAnalyze = `[binary content, sha256=${sha}, len=${fullBuf.length}]`;
   }
 
   const vgeResult = await analyzeToolOutput(
@@ -321,7 +325,12 @@ export async function startDaemon(socketPath?: string): Promise<{ stop: () => Pr
 
   startWatcher();
 
-  const gcTimer = setInterval(() => gcIdleSessions(24), 60_000);
+  // PR-review C3: read TTL from config (1–168h range enforced by zod), not hardcoded.
+  const gcTimer = setInterval(() => {
+    const ttl = getCurrentConfig()?.policy.session_idle_ttl_hours
+      ?? DEFAULT_CONFIG.policy.session_idle_ttl_hours;
+    gcIdleSessions(ttl);
+  }, 60_000);
 
   process.on('unhandledRejection', (reason) => {
     console.error('[daemon] unhandledRejection:', reason);
