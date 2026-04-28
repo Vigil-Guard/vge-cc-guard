@@ -1212,3 +1212,63 @@ CONFIG_DESIGN §9 Phase 1c additions: Events, Pending, Audit, Stats screens.
 ### Stop conditions for the human in the loop
 
 The plan above should run to completion without re-opening design decisions. If during execution a question arises that is not answered by §1–§13, that is a signal to stop, document the gap, and update the PRD before writing more code. The intent of the 2026-04-26 design lock is that this should not happen for in-scope work.
+
+---
+
+## §14 Open Issues — to resolve before Phase 1 release
+
+> Issues identified after the 2026-04-26 design lock that the PRD does not currently answer. Each entry needs a decision and an implementation plan before `1.0.0`.
+
+### §14.1 SANITIZED user prompts — PII redaction is not wired through
+
+**Discovered:** 2026-04-28, post-Sprint 3.
+
+**Problem.** VGE `/v1/guard/input` may return `decision: "SANITIZED"` together with a `sanitized_text` field — a placeholder-substituted version of the user's prompt with PII (PESEL, NIP, credit-card, email, etc.) replaced by `<TYPE_REDACTED>` tokens. The contractual intent is: **the model must never see the original PII**, only the sanitized version.
+
+The current sidecar implementation does not honour this:
+
+- `handleUserPrompt` ([src/daemon/http-server.ts](../../../src/daemon/http-server.ts)) calls `postUserPrompt(prompt, sessionId)` as **fire-and-forget** and returns `ccOutput: null` immediately.
+- `postUserPrompt` ([src/daemon/vge-client.ts](../../../src/daemon/vge-client.ts)) does not consume the response at all — the VGE decision (`ALLOWED` / `SANITIZED` / `BLOCKED`) is discarded before it can affect what reaches the model.
+
+Net effect: a prompt containing a PESEL number is forwarded to Claude verbatim, even if VGE flagged it.
+
+**Why this is more than a bug.** PRD §7 explicitly states `UserPromptSubmit` is async fire-and-forget (lines 82, 106). Honouring SANITIZED requires a **synchronous gate with timeout** on this hook — a deviation from the locked design that has implications for prompt-typing latency.
+
+**Constraint imposed by Claude Code hook protocol.** CC's `UserPromptSubmit` hook output schema only supports `decision: "block"` (rejects the prompt) and `additionalContext` (added BEFORE the user's prompt — does NOT replace it). There is no `updatedPrompt` field; `updatedInput` exists only for `PreToolUse`. The only mechanism by which the model can be guaranteed never to see the original PII is to **block** the original and surface the sanitized version through the `reason` field for the user to copy-paste and resubmit.
+
+**Proposed direction (needs approval before implementation):**
+
+1. Make `handleUserPrompt` synchronous with a short timeout (~3 s):
+   - On `decision === "BLOCKED"` → CC response `{ decision: "block", reason: <vge_reason> }`.
+   - On `decision === "SANITIZED"` → CC response `{ decision: "block", reason: "VGE detected PII. Sanitized version below — please review and resubmit:\n\n<sanitized_text>" }`.
+   - On `decision === "ALLOWED"` → pass-through (current behaviour).
+   - On timeout / VGE error → fail-open with audit log entry (PRD §7.6 fail-mode preserved).
+2. Pending-escalation reply parser keeps priority: if the session has `pendingEscalations.length > 0`, run the existing `parseReply` path FIRST and skip the VGE gate (otherwise `once`/`session`/`block`/`quarantine` tokens would themselves be POSTed and could be flagged).
+3. New audit event types: `user_prompt_sanitized`, `user_prompt_blocked`, `user_prompt_allowed` (only the last one is optional / sample-rated).
+4. Update PRD §7 (currently states fire-and-forget) and the architecture doc §3 / §7.6 / §7.6 fail-mode table.
+
+**Open sub-questions:**
+- Does VGE's `/v1/guard/input` response always include `sanitized_text` when `decision === "SANITIZED"`, or are there cases where only `decision_flags` indicate redaction without supplying a redacted body?
+- Is a 3 s timeout acceptable on every keystroke-final prompt? CONFIG_DESIGN may need a per-user opt-out.
+- Should a SANITIZED outcome also affect session state (e.g. transition to `caution`), or is the prompt block alone sufficient?
+
+### §14.2 Audit semantics of `decision = SANITIZED` in `tool_output` analysis — possibly miscategorised
+
+**Discovered:** 2026-04-28, while diagnosing §14.1 — the SANITIZED branch in the Confidence Router was reviewed and may itself be wrong.
+
+**Current behaviour.** [Confidence Router](../../../src/daemon/confidence-router.ts) maps `decision === "SANITIZED"` to `SOFT_TAINT`, which then transitions the session to `caution` (`handlePostTool` in [http-server.ts](../../../src/daemon/http-server.ts)). The mapping was added in Sprint 2 per PRD §7.7 line 632 (`if response.decision == "SANITIZED" -> SOFT_TAINT`).
+
+**Why this is suspect.** §14.1 establishes that `SANITIZED` semantically means "I redacted PII from the user-facing payload". For `tool_output` analysis (PostToolUse), VGE returning `SANITIZED` would mean "the tool's output contained PII; I redacted it before returning". That is a **PII-leakage signal from a tool**, not a prompt-injection caution signal. Treating it as `SOFT_TAINT → caution` conflates two distinct categories:
+
+- **Prompt-injection caution** (correct mapping for `threatLevel: MEDIUM`, `attackSimilarity > safeSimilarity`, `scopeDrift.NEAR_SCOPE`, FAILOPEN flags).
+- **PII-in-output detection** (probably warrants its own session signal — a `pii_leak_detected` flag, separate audit channel, possibly a different action like advisory feedback to the user rather than tainting the whole session).
+
+**To investigate before changing anything:**
+1. Read VGE's actual `/v1/guard/analyze` response contract — does `decision: "SANITIZED"` for `source: "tool_output"` ever occur in practice? With what `decision_flags`?
+2. Cross-reference with the architecture doc §7.6 line 196 (`caution — decision = SANITIZED, ...`) — that line was written when the sidecar conflated the two semantics; it may need to be split.
+3. Check what other VGE consumers (`vigil-extension`, `vigil-sdk`) do with `SANITIZED` for `tool_output` source. If nobody else uses it, the field may be a dead-letter for that source and the mapping is harmless. If someone treats it as PII-leak, the sidecar's caution-mapping is misaligned.
+4. Decide: keep `SANITIZED → SOFT_TAINT` (treat any redaction as a caution), or split into two outcomes (`PII_REDACTED` vs `INJECTION_CAUTION`) with separate session-state implications.
+
+**Risk if left unaddressed:** the current code may be turning legitimate PII-detection events (a user's repo containing a real customer PESEL in tool output) into spurious session taints, blocking subsequent tool calls for the wrong reason and confusing the user. Or — depending on VGE's contract — the mapping might be vestigial / never triggered, which is harmless but should be removed for clarity.
+
+**Owner:** to be assigned during Sprint 4 planning. This is not a regression; it predates Sprint 3 and was inherited from the original PRD §7.7.
