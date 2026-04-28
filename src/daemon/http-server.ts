@@ -106,6 +106,18 @@ async function handleUserPrompt(req: Request, res: Response): Promise<void> {
 }
 
 function handlePreTool(req: Request, res: Response): void {
+  try {
+    handlePreToolInner(req, res);
+  } catch (err) {
+    // PR-review C2: daemon must NEVER let an exception bubble to Express's
+    // default 500 handler. The shim's fail-closed contract relies on a parseable
+    // hookSpecificOutput response; a 500 with HTML body would silently fail-open.
+    console.error('[handlePreTool] unhandled exception:', err);
+    denyResponse(res, 'VGE Agent Guard: internal error — denying for safety.');
+  }
+}
+
+function handlePreToolInner(req: Request, res: Response): void {
   const payload = req.body as CCPreToolPayload;
   const session = getSession(payload.session_id) ?? createSession(payload.session_id, null);
   const config = getCurrentConfig() ?? DEFAULT_CONFIG;

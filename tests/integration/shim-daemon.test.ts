@@ -226,6 +226,65 @@ describe('shim-daemon integration', () => {
     expect(stdout).toBe('');
   });
 
+  it('A11 [PR-C2]: pretool with HTML/non-JSON daemon body → exit 2 (fail-closed)', async () => {
+    // Spin up a rogue server on a separate temp dir and point the shim there.
+    const rogueDir = fs.mkdtempSync('/tmp/vge-rogue-');
+    const rogueSocket = path.join(rogueDir, 'daemon.sock');
+    const http = await import('http');
+    const rogue = http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html>internal error</html>');
+    });
+    await new Promise<void>((resolve) => rogue.listen(rogueSocket, () => resolve()));
+
+    const orig = process.env['VGE_CC_GUARD_CONFIG_DIR'];
+    process.env['VGE_CC_GUARD_CONFIG_DIR'] = rogueDir;
+
+    try {
+      const { exitCode } = await runShim('pretool', {
+        session_id: 'shim-c2',
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Bash',
+        tool_input: { command: 'ls' },
+      });
+      expect(exitCode).toBe(2);
+    } finally {
+      await new Promise<void>((resolve) => rogue.close(() => resolve()));
+      fs.rmSync(rogueDir, { recursive: true, force: true });
+      if (orig === undefined) delete process.env['VGE_CC_GUARD_CONFIG_DIR'];
+      else process.env['VGE_CC_GUARD_CONFIG_DIR'] = orig;
+    }
+  });
+
+  it('A12 [PR-C2]: pretool with daemon 500 status → exit 2 (fail-closed)', async () => {
+    const rogueDir = fs.mkdtempSync('/tmp/vge-rogue-500-');
+    const rogueSocket = path.join(rogueDir, 'daemon.sock');
+    const http = await import('http');
+    const rogue = http.createServer((_req, res) => {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end('{"error":"boom"}');
+    });
+    await new Promise<void>((resolve) => rogue.listen(rogueSocket, () => resolve()));
+
+    const orig = process.env['VGE_CC_GUARD_CONFIG_DIR'];
+    process.env['VGE_CC_GUARD_CONFIG_DIR'] = rogueDir;
+
+    try {
+      const { exitCode } = await runShim('pretool', {
+        session_id: 'shim-c2-500',
+        hook_event_name: 'PreToolUse',
+        tool_name: 'Bash',
+        tool_input: { command: 'ls' },
+      });
+      expect(exitCode).toBe(2);
+    } finally {
+      await new Promise<void>((resolve) => rogue.close(() => resolve()));
+      fs.rmSync(rogueDir, { recursive: true, force: true });
+      if (orig === undefined) delete process.env['VGE_CC_GUARD_CONFIG_DIR'];
+      else process.env['VGE_CC_GUARD_CONFIG_DIR'] = orig;
+    }
+  });
+
   it('A10: SessionEnd → exit 0, empty stdout', async () => {
     await runShim('sessionstart', { session_id: 'shim-a10', hook_event_name: 'SessionStart' });
     const { exitCode, stdout } = await runShim('sessionend', {

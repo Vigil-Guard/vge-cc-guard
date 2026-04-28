@@ -19,7 +19,12 @@ function readStdin(): Promise<string> {
   });
 }
 
-function sendToSocket(socketPath: string, event: string, payload: unknown): Promise<string | null> {
+interface SocketResult {
+  body: string;
+  status: number;
+}
+
+function sendToSocket(socketPath: string, event: string, payload: unknown): Promise<SocketResult | null> {
   return new Promise((resolve) => {
     // Daemon routes expect the CC payload directly; event name is conveyed via URL path.
     const body = JSON.stringify(payload);
@@ -37,7 +42,9 @@ function sendToSocket(socketPath: string, event: string, payload: unknown): Prom
       (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
-        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        res.on('end', () =>
+          resolve({ body: Buffer.concat(chunks).toString('utf8'), status: res.statusCode ?? 0 }),
+        );
       },
     );
     req.on('error', () => resolve(null));
@@ -50,27 +57,33 @@ function sendToSocket(socketPath: string, event: string, payload: unknown): Prom
   });
 }
 
-// Daemon returns different shapes per event.
-// pretool: { hookSpecificOutput: {...} }  — already CC-ready, write as-is.
-// posttool/userprompt: { ccOutput: <payload|null> } — write ccOutput if non-null.
-// sessionstart/sessionend: { ok: true } — write nothing.
-function writeResponse(event: string, responseText: string): void {
+// Returns true iff the response was successfully forwarded to stdout in the
+// shape Claude Code expects. False signals a malformed/non-JSON daemon response —
+// caller decides exit code (fail-closed for pretool, fail-open otherwise).
+function writeResponse(event: string, responseText: string): boolean {
   let parsed: unknown;
   try {
     parsed = JSON.parse(responseText);
   } catch {
-    return;
+    return false;
   }
 
   if (event === 'pretool') {
+    // Daemon for pretool returns CC-ready { hookSpecificOutput: {...} }.
+    // Verify the shape before claiming success — otherwise CC sees nothing
+    // and defaults to allow (fail-open). PR-review C2.
+    const hso = (parsed as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput;
+    if (!hso || typeof hso.permissionDecision !== 'string') return false;
     process.stdout.write(responseText.trimEnd() + '\n');
-    return;
+    return true;
   }
 
+  // posttool / userprompt / sessionstart / sessionend: { ccOutput: ... }
   const wrapped = parsed as { ccOutput?: unknown };
   if (wrapped.ccOutput != null) {
     process.stdout.write(JSON.stringify(wrapped.ccOutput) + '\n');
   }
+  return true;
 }
 
 export async function main(): Promise<void> {
@@ -99,15 +112,21 @@ export async function main(): Promise<void> {
   await ensureDaemonRunning();
 
   const socketPath = getSocketPath();
-  const responseText = await sendToSocket(socketPath, event, payload);
+  const result = await sendToSocket(socketPath, event, payload);
 
-  if (responseText === null) {
+  if (result === null) {
     process.exit(event === 'pretool' ? 2 : 0);
   }
 
-  try {
-    writeResponse(event, responseText);
-  } catch {
+  // Non-2xx from daemon → unparseable shape almost always; fail-closed for pretool.
+  if (result.status < 200 || result.status >= 300) {
+    process.stderr.write(`vge-cc-guard hook: daemon returned status ${result.status}\n`);
+    process.exit(event === 'pretool' ? 2 : 0);
+  }
+
+  const ok = writeResponse(event, result.body);
+  if (!ok) {
+    process.stderr.write('vge-cc-guard hook: malformed daemon response\n');
     process.exit(event === 'pretool' ? 2 : 0);
   }
 

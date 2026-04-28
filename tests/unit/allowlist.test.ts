@@ -49,4 +49,40 @@ describe('allowlist', () => {
     const k2 = canonicalizeKey('Custom', { action: 'run', timestamp: 999 });
     expect(k1).toBe(k2);
   });
+
+  // W4 from PR review — never throw on malformed input; always return a stable key.
+  it('WebFetch with invalid URL → malformed-tagged fallback (no throw)', () => {
+    const key = canonicalizeKey('WebFetch', { url: 'not-a-url' });
+    expect(key).toMatch(/^WebFetch:malformed:[a-f0-9]{12}$/);
+  });
+
+  it('WebFetch with missing url → malformed-tagged fallback', () => {
+    const key = canonicalizeKey('WebFetch', {} as Record<string, unknown>);
+    expect(key).toMatch(/^WebFetch:malformed:[a-f0-9]{12}$/);
+  });
+
+  it('Bash with missing command → malformed-tagged fallback', () => {
+    const key = canonicalizeKey('Bash', {} as Record<string, unknown>);
+    expect(key).toMatch(/^Bash:malformed:[a-f0-9]{12}$/);
+  });
+
+  it('Read with missing file_path → malformed-tagged fallback', () => {
+    const key = canonicalizeKey('Read', {} as Record<string, unknown>);
+    expect(key).toMatch(/^Read:malformed:[a-f0-9]{12}$/);
+  });
+
+  it('Write with missing content → malformed-tagged fallback', () => {
+    const key = canonicalizeKey('Write', { file_path: '/tmp/x.ts' } as Record<string, unknown>);
+    expect(key).toMatch(/^Write:malformed:[a-f0-9]{12}$/);
+  });
+
+  it('canonicalizeKey never throws (defensive contract)', () => {
+    // Various pathological inputs that previously threw TypeError
+    expect(() => canonicalizeKey('Bash', {} as Record<string, unknown>)).not.toThrow();
+    expect(() => canonicalizeKey('Read', {} as Record<string, unknown>)).not.toThrow();
+    expect(() => canonicalizeKey('Edit', {} as Record<string, unknown>)).not.toThrow();
+    expect(() => canonicalizeKey('Task', {} as Record<string, unknown>)).not.toThrow();
+    expect(() => canonicalizeKey('WebFetch', {} as Record<string, unknown>)).not.toThrow();
+    expect(() => canonicalizeKey(undefined as unknown as string, undefined as unknown as Record<string, unknown>)).not.toThrow();
+  });
 });
