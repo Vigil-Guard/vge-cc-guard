@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -9,9 +10,16 @@ interface SessionFile {
   data: Record<string, unknown>;
 }
 
+function resolveVgeDir(): string {
+  return process.env['VGE_CC_GUARD_CONFIG_DIR'] ?? path.join(os.homedir(), '.vge-cc-guard');
+}
+
 function resolveSessionsDir(): string {
-  const base = process.env['VGE_CC_GUARD_CONFIG_DIR'] ?? path.join(os.homedir(), '.vge-cc-guard');
-  return path.join(base, 'sessions');
+  return path.join(resolveVgeDir(), 'sessions');
+}
+
+function resolveSocketPath(): string {
+  return path.join(resolveVgeDir(), 'daemon.sock');
 }
 
 function loadSessions(sessionsDir: string): SessionFile[] {
@@ -35,16 +43,39 @@ function loadSessions(sessionsDir: string): SessionFile[] {
   return sessions.sort((a, b) => b.lastActivity - a.lastActivity);
 }
 
-export async function runResetSession(): Promise<void> {
-  const sessionsDir = resolveSessionsDir();
-  const sessions = loadSessions(sessionsDir);
+// PR-review C1: prefer the daemon's control endpoint so that in-memory state
+// (sessionStore) is reset alongside the disk file. Falls back to disk-only
+// mutation when the daemon isn't reachable.
+function tryDaemonReset(sessionId: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ session_id: sessionId });
+    const req = http.request(
+      {
+        socketPath: resolveSocketPath(),
+        path: '/v1/control/reset-session',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: 2_000,
+      },
+      (res) => {
+        res.on('data', () => undefined);
+        res.on('end', () => resolve((res.statusCode ?? 0) >= 200 && (res.statusCode ?? 0) < 300));
+      },
+    );
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.write(body);
+    req.end();
+  });
+}
 
-  if (sessions.length === 0) {
-    console.log('No active sessions found.');
-    return;
-  }
-
-  const target = sessions[0]!;
+function resetOnDisk(target: SessionFile): void {
   const updated = {
     ...target.data,
     allowlist: [],
@@ -52,8 +83,29 @@ export async function runResetSession(): Promise<void> {
     escalationCount: 0,
     state: 'clean',
   };
-
   fs.writeFileSync(target.filePath, JSON.stringify(updated, null, 2), 'utf-8');
-  console.log(`Session reset: ${target.sessionId}`);
-  console.log('The session will resume in clean state.');
+}
+
+export async function runResetSession(): Promise<void> {
+  const sessions = loadSessions(resolveSessionsDir());
+  if (sessions.length === 0) {
+    console.log('No active sessions found.');
+    return;
+  }
+
+  const target = sessions[0]!;
+
+  const daemonOk = await tryDaemonReset(target.sessionId);
+  if (daemonOk) {
+    console.log(`Session reset (via daemon): ${target.sessionId}`);
+    console.log('The session will resume in clean state.');
+    return;
+  }
+
+  // Daemon unreachable — disk-only fallback. Will be authoritative iff the
+  // daemon never starts back up; otherwise the daemon's next persistSession
+  // for this session would overwrite the reset.
+  resetOnDisk(target);
+  console.log(`Session reset (disk-only — daemon was not reachable): ${target.sessionId}`);
+  console.log('Restart Claude Code if the session looks stuck.');
 }

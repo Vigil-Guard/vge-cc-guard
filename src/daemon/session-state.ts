@@ -85,6 +85,50 @@ export function dequeueEscalation(sessionId: string): Escalation | undefined {
   return esc;
 }
 
+// PR-review C1: clears in-memory + on-disk session state. Used by both the
+// daemon's /v1/control/reset-session route and reset-session CLI fallback when
+// the daemon isn't running.
+export function resetSession(sessionId: string): boolean {
+  const now = Date.now();
+  const data = sessionStore.get(sessionId);
+  let touchedMemory = false;
+  let touchedDisk = false;
+
+  if (data) {
+    data.state = 'clean';
+    data.allowlist = new Set<string>();
+    data.pendingEscalations = [];
+    data.escalationCount = 0;
+    data.lastActivity = now;
+    persistSession(data);
+    touchedMemory = true;
+  }
+
+  // Also handle the case where the daemon was restarted between session creation
+  // and reset — the file exists on disk but isn't in memory.
+  const dir = getSessionsDir();
+  const filePath = path.join(dir, `${sessionId}.json`);
+  if (!touchedMemory && fs.existsSync(filePath)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Record<string, unknown>;
+      const reset = {
+        ...raw,
+        state: 'clean',
+        allowlist: [],
+        pendingEscalations: [],
+        escalationCount: 0,
+        lastActivity: now,
+      };
+      fs.writeFileSync(filePath, JSON.stringify(reset), 'utf-8');
+      touchedDisk = true;
+    } catch {
+      // malformed file — ignore, caller will get false
+    }
+  }
+
+  return touchedMemory || touchedDisk;
+}
+
 export function gcIdleSessions(ttlHours: number): void {
   const cutoff = Date.now() - ttlHours * 3600 * 1000;
   for (const [id, data] of sessionStore) {

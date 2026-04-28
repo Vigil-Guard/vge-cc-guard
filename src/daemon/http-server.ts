@@ -20,6 +20,7 @@ import {
   transitionState,
   enqueueEscalation,
   gcIdleSessions,
+  resetSession,
 } from './session-state.js';
 import { canonicalizeKey } from './allowlist.js';
 import { routeResponse } from './confidence-router.js';
@@ -298,6 +299,18 @@ export async function startDaemon(socketPath?: string): Promise<{ stop: () => Pr
   app.post('/v1/hooks/userprompt', (req, res) => { void handleUserPrompt(req, res); });
   app.post('/v1/hooks/pretool', handlePreTool);
   app.post('/v1/hooks/posttool', (req, res) => { void handlePostTool(req, res); });
+
+  // PR-review C1: control plane for the reset-session CLI command.
+  // The Unix socket is local-only, so no auth is needed at this layer.
+  app.post('/v1/control/reset-session', (req, res) => {
+    const body = req.body as { session_id?: string };
+    if (!body?.session_id) {
+      res.status(400).json({ ok: false, error: 'missing session_id' });
+      return;
+    }
+    const reset = resetSession(body.session_id);
+    res.json({ ok: true, reset, session_id: body.session_id });
+  });
 
   const server = http.createServer(app);
 
