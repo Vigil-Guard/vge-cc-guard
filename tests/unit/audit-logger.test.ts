@@ -36,6 +36,34 @@ describe('audit-logger', () => {
       .map((line) => JSON.parse(line) as object);
   }
 
+  it('PR-W1: stale audit.log from yesterday is rotated on first append today (process restart case)', async () => {
+    // Plant a "yesterday" audit.log with mtime set 2 days ago
+    const logPath = path.join(tmpDir, 'audit.log');
+    fs.writeFileSync(logPath, JSON.stringify({ event_type: 'old', timestamp: '2026-04-26T12:00:00Z' }) + '\n');
+    const twoDaysAgo = Date.now() - 2 * 24 * 3600 * 1000;
+    fs.utimesSync(logPath, twoDaysAgo / 1000, twoDaysAgo / 1000);
+
+    // Fresh module load — simulates daemon restart
+    vi.resetModules();
+    const fresh = await import('../../src/daemon/audit-logger.js');
+
+    fresh.logCredentialPathDenied({
+      sessionId: 'sess_w1',
+      resolvedPath: '/x/y',
+      credentialProtectionEnabled: true,
+    });
+
+    // Yesterday's log should have been rotated to audit.log.YYYY-MM-DD
+    const rotated = fs
+      .readdirSync(tmpDir)
+      .find((f) => /^audit\.log\.\d{4}-\d{2}-\d{2}$/.test(f));
+    expect(rotated).toBeDefined();
+    // Today's audit.log contains only the new event
+    const events = readLog();
+    expect(events).toHaveLength(1);
+    expect((events[0] as { event_type: string }).event_type).toBe('credential_path_denied');
+  });
+
   it("logToolOutputEscalated writes JSONL with event_type='tool_output_escalated'", () => {
     logger.logToolOutputEscalated({
       escalationId: 'esc_1',

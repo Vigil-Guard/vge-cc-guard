@@ -13,11 +13,25 @@ function getLogPath(): string {
 
 let lastWriteDate = '';
 
+// PR-review W1: across daemon restarts, derive lastWriteDate from the existing
+// audit.log mtime so a stale log from yesterday gets rotated on the first append today.
+function bootstrapLastWriteDate(logPath: string): void {
+  if (lastWriteDate) return;
+  try {
+    const mtime = fs.statSync(logPath).mtime;
+    lastWriteDate = mtime.toISOString().slice(0, 10);
+  } catch {
+    // file doesn't exist yet — leave empty; first write will set today
+  }
+}
+
 function appendEvent(event: Record<string, unknown>): void {
   const dir = getLogDir();
   fs.mkdirSync(dir, { recursive: true });
   const today = new Date().toISOString().slice(0, 10);
   const logPath = getLogPath();
+
+  bootstrapLastWriteDate(logPath);
 
   if (lastWriteDate && lastWriteDate !== today && fs.existsSync(logPath)) {
     fs.renameSync(logPath, path.join(dir, `audit.log.${lastWriteDate}`));
