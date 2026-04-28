@@ -1,12 +1,38 @@
 # vge-cc-guard — Claude Code Sidecar for VGE
 
-BLOCK-default runtime policy for Claude Code, backed by VGE detection. Tool gating with credential path protection, per-resource session allowlist, full local audit trail, and a TUI configurator. Distributed as an npm package.
+**A security overlay that sits between Claude Code and your machine.** Every time Claude Code wants to run a tool (`Bash`, `Read`, `Write`, `WebFetch`, …), the call is intercepted, evaluated locally for safety, and either allowed, denied, or queued for your decision. Tool outputs are forwarded to **VGE** (Vigil Guard Enterprise) for prompt-injection / data-leak analysis; suspicious responses taint the session so subsequent risky tools are blocked.
 
-> **Status:** Sprints 1–3 complete (2026-04-27). Core sidecar is functional: shim, daemon, install/uninstall, lazy-start, session management, VGE integration, audit trail. Sprint 4 (TUI configurator + E2E tests) is next. See [PRD_1](docs/prd/PRD_1/PRD_1.md) for the locked specification.
+In one sentence: **a local broker that gives you allow / deny / ask / taint control over an AI agent's tool use, with a full audit trail.**
+
+### Why you might want it
+
+- You give Claude Code real shell and filesystem access. You'd like a kill switch when it goes off the rails.
+- You want guarantees that `~/.aws/credentials`, `~/.ssh/`, `.env` files etc. never get read by the model — even if a prompt-injected instruction asks for them.
+- A `WebFetch` of a malicious page that smuggled an instruction into its body should taint the session, not silently steer the agent.
+- You want a JSONL audit trail of every blocked / escalated / analyzed tool call for incident review.
+
+### How it works in 30 seconds
+
+```
+Claude Code  ──hook──►  shim (per-event courier)  ──Unix socket──►  daemon (long-running policy engine)
+                                                                          │
+                                                                          ├─ credential path deny list
+                                                                          ├─ session allowlist + tainted-state guard
+                                                                          ├─ per-tool gate (allow/block/ask)
+                                                                          └─ POST /v1/guard/analyze ──► VGE
+                                                                                  │
+                                                                                  ▼
+                                                                          Confidence Router
+                                                                          (HARD_TAINT / SOFT_TAINT / ESCALATE / ALLOW)
+```
+
+The shim is a tiny stateless process invoked by Claude Code on every hook event. The daemon does all the policy work, holds session state in memory, and persists it to `~/.vge-cc-guard/`. **Fail-closed for `PreToolUse`** (if the daemon is unreachable, the tool is denied, not allowed). All other events fail-open.
+
+> **Status:** Sprints 1–3 complete (2026-04-28). Core sidecar is functional: shim, daemon, install/uninstall, lazy-start, session management, VGE integration, audit trail, fail-closed pretool contract, hardened canonicalization. Sprint 4 (TUI configurator + E2E tests) is next. See [PRD_1](docs/prd/PRD_1/PRD_1.md) for the locked specification.
 
 ---
 
-## What it does
+## What it does (full feature list)
 
 - **Replaces the Phase 0 bash hook.** A native TypeScript sidecar handles `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SessionStart`, `SessionEnd` for Claude Code.
 - **Gates tool execution** at `PreToolUse` with `permissionDecision: allow / deny / ask` based on a deterministic priority list (credential path deny list → pending escalation → allowlist → tainted-state guard → per-tool config). Decision is local; no VGE round-trip on the critical path.
@@ -187,7 +213,7 @@ vge-cc-guard uninstall     # restore settings.json from snapshot, delete ~/.vge-
 |---|---|---|
 | **1** Foundation | ✅ Done | Shared types, config schema, IPC protocol, CLI scaffold |
 | **2** Daemon core | ✅ Done | HTTP server, all hook handlers, session state, tool policy, Confidence Router, ask-dialog, credential path protection, VGE client, audit JSONL |
-| **3** Shim + Install | ✅ Done | Shim (stdin → socket → stdout), lazy-start, install/uninstall/reset-session commands |
+| **3** Shim + Install | ✅ Done | Shim (stdin → socket → stdout), lazy-start, install/uninstall/reset-session commands, **fail-closed pretool contract**, **canonicalizeKey hardening**, **reset-session control endpoint**, **crash-safe atomic writes** |
 | **4** TUI + E2E | 🔲 Next | `vge-cc-guard config` TUI (4 screens), end-to-end test suite |
 | **5** Resilience + Beta | 🔲 Planned | VGE retry/backoff, response cache, debug log rotation, closed-beta `0.9.0-beta.x` |
 | **`1.0.0`** | 🔲 Planned | npm tagged release |
